@@ -72,6 +72,15 @@ Changes require a new session to take effect. 改动需新开会话才生效。
 
 ## Verification / 验证
 
+Local check (no DSH needed) — simulates the whole `agent/created` → `agent/pre-step` chain and asserts
+the rewrite only touches the time-context timestamp:
+
+本地自检（不需要 DSH 在场）—— 模拟 `agent/created` → `agent/pre-step` 全链路，断言只改时间戳：
+
+```sh
+node test/verify-plugin.mjs    # → ALL CHECKS PASSED
+```
+
 In a new session, the injected context should show a deep-night hour with a fixed-offset zone, e.g.:
 
 在新会话中，注入的上下文应显示深夜小时与固定偏移时区，例如：
