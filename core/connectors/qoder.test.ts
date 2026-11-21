@@ -160,8 +160,20 @@ describe("qoder-wire 错误分类", () => {
     expect(classifyFailure(403, '{"code":144,"message":"low"}')).toBe("quota-exhausted");
   });
 
+  it("403 + code 147 是付费资源包余额不足，不是凭据失效", () => {
+    const body =
+      '{"code":"147","message":"Paid resource package balance is low","modelKey":"qfmodel"}';
+    expect(classifyHttpStatus(403, body)).toBe("auth");
+    expect(classifyFailure(403, body)).toBe("quota-exhausted");
+    // 整数写法与嵌套 message 同样按业务码兜底。
+    expect(classifyFailure(403, '{"code":147,"message":"low"}')).toBe("quota-exhausted");
+    expect(
+      classifyFailure(403, '{"code":"403","message":"{\\"code\\":\\"147\\",\\"modelKey\\":\\"qfmodel\\"}"}'),
+    ).toBe("quota-exhausted");
+  });
+
   it("每一张配额码表条目都优先于 403 的 auth 兜底", () => {
-    for (const code of ["110", "111", "112", "144"]) {
+    for (const code of ["110", "111", "112", "144", "147"]) {
       expect(classifyFailure(403, JSON.stringify({ code }))).toBe("quota-exhausted");
     }
   });
@@ -185,6 +197,19 @@ describe("qoder-wire 错误分类", () => {
     expect(businessCodeOf('{"code":1.5}')).toBeUndefined();
     expect(businessCodeOf("not json")).toBeUndefined();
     expect(deepestBusinessCode('{"message":"{\\"code\\":\\"10605\\"}"}')).toBe("10605");
+  });
+
+  it("外壳把 HTTP 状态码回显进 code 时继续下钻（实测 qoder 形态）", () => {
+    // 现场：403 {"code":"403","message":"{\"code\":\"10605\",…}"}（上游插件 #44/#50）
+    expect(deepestBusinessCode('{"code":"403","message":"{\\"code\\":\\"10605\\"}"}')).toBe("10605");
+    expect(classifyFailure(403, '{"code":"403","message":"{\\"code\\":\\"10605\\"}"}')).toBe(
+      "rate-limited",
+    );
+    // 钻不到内层业务码时，仍把外壳那个值还回去，行为与改前一致（403 → auth）。
+    expect(deepestBusinessCode('{"code":"403","message":"just text"}')).toBe("403");
+    expect(classifyFailure(403, '{"code":"403","message":"just text"}')).toBe("auth");
+    // 真正的业务码（非状态码）仍优先返回，不再下钻。
+    expect(deepestBusinessCode('{"code":"110","message":"{\\"code\\":\\"403\\"}"}')).toBe("110");
   });
 
   it("retryAfterSeconds 从嵌套 message 里取", () => {
