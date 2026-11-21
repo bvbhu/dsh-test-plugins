@@ -132,12 +132,17 @@ export type UpstreamErrorKind =
  * - `110` 当日用量用尽；
  * - `111` 套餐过期；
  * - `112` 模型额度用尽（上游带 `pricingUrl`）；
- * - `144` 专属积分包余额不足（上游带 `modelKey`）。
+ * - `144` 专属积分包余额不足（上游带 `modelKey`）；
+ * - `147` **付费**资源包余额不足（上游带 `modelKey`，如 `qfmodel`）。
  *
  * 这些码通常由 HTTP 403 承载，但语义是「额度不足、会自愈/需充值」，
  * 不是凭据失效。漏一个码就会在分类时回落成 auth，给用户错误提示。
+ *
+ * `144` / `147` 的现场出处：上游插件 issue #45 / #48（`1.26.1` / `1.27.1`
+ * 按「加进配额族」修复）；两者报错文案里都带 `modelKey`，是**按模型**的
+ * 额度不足，其余模型可能仍可用。
  */
-export const QUOTA_CODES: ReadonlySet<string> = new Set(["110", "111", "112", "144"]);
+export const QUOTA_CODES: ReadonlySet<string> = new Set(["110", "111", "112", "144", "147"]);
 
 const CONTENT_POLICY_MARKERS = [
   "DataInspectionFailed",
@@ -180,24 +185,47 @@ export function businessCodeOf(detail: string): string | undefined {
 
 const MAX_CODE_NESTING = 6;
 
+/** HTTP 状态码集合：`code` 落在这些值上时，通常只是外壳把状态码回显了一遍。 */
+const STATUS_ECHO_CODES: ReadonlySet<string> = new Set([
+  "400",
+  "401",
+  "403",
+  "404",
+  "408",
+  "409",
+  "418",
+  "422",
+  "429",
+  "500",
+  "502",
+  "503",
+  "504",
+]);
+
 /**
  * 下钻取最深一层的业务码：上游的错误常在 `message` 里再套一层 JSON
  * （`{"code":"10605","message":"{\"retryAfterSeconds\":5,…}"}`）。
+ *
+ * ⚠️ 外壳会把 HTTP 状态码写进 `code`：实测 qoder 的排队/额度错误形态是
+ * `403 {"code":"403","message":"{\"code\":\"10605\"|\"144\"|\"147\",…}"}`
+ * （见上游插件 issue #44 / #50）。若在 `code==="403"` 处直接返回，就会把
+ * 「排队/额度不足」误判成 `auth`（凭据失效）。所以**状态码回显不算业务码**，
+ * 要继续往 `message` 里钻；钻不到才把外壳那个值还回去。
  */
 export function deepestBusinessCode(detail: string, depth = 0): string | undefined {
   const code = businessCodeOf(detail);
-  if (code !== undefined) return code;
-  if (depth >= MAX_CODE_NESTING) return undefined;
+  if (code !== undefined && !STATUS_ECHO_CODES.has(code)) return code;
+  if (depth >= MAX_CODE_NESTING) return code;
   let parsed: unknown;
   try {
     parsed = JSON.parse(detail.trim());
   } catch {
-    return undefined;
+    return code;
   }
-  if (typeof parsed !== "object" || parsed === null) return undefined;
+  if (typeof parsed !== "object" || parsed === null) return code;
   const message = (parsed as Record<string, unknown>)["message"];
-  if (typeof message !== "string") return undefined;
-  return deepestBusinessCode(message, depth + 1);
+  if (typeof message !== "string") return code;
+  return deepestBusinessCode(message, depth + 1) ?? code;
 }
 
 /**
