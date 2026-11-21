@@ -1,7 +1,7 @@
 # 项目交接文档 — dsh-pixmax-workflow
 
-> 更新时间：2026-11-11 21:20 CST
-> 仓库：`D:\projects\dsh-pixmax-workflow`（git repo）
+> 更新时间：2026-11-22（目录重组；正文结论仍反映 11-13 的真机状态）
+> 仓库：`D:\projects\dsh-test-plugins\dsh-pixmax-workflow`（git repo）
 > 远程：`origin → https://github.com/bvbhu/dsh-pixmax-workflow.git`（原 `bvbhu/dsh-shotflow` 已改名，旧地址自动重定向）
 > 分支：main（默认），已推送并跟踪 `origin/main`；最新提交见 `git log -1`
 > desktop：已通过 `dsh plugin --profile desktop add github:bvbhu/dsh-pixmax-workflow` 安装 v0.3.0；改动后需重新拉取并重启 DSH
@@ -45,7 +45,7 @@ desktop profile 的 `cordis.patch.yml` 里原有三条 `- id: pixmax-tools / vid
 ## 三、目录
 
 ```
-D:\projects\dsh-pixmax-workflow\
+D:\projects\dsh-test-plugins\dsh-pixmax-workflow\
 ├─ package.json          # main → src/settings-host.mjs；dsh.bundle.patch 为数组
 ├─ cordis.patch.yml      # 只声明 bundle 主行（工具行在 presets/ 里）
 ├─ presets/
@@ -55,15 +55,20 @@ D:\projects\dsh-pixmax-workflow\
 ├─ locale/ icon.svg
 ├─ src/
 │  ├─ settings-host.mjs      # 主行：6 个 HTTP 端点
-│  ├─ pixmax-config.mjs      # <root>/pixmax-cli.json 读写（本次新增）
+│  ├─ pixmax-config.mjs      # <root>/pixmax-cli.json 读写
 │  ├─ image-tools.mjs / image-models.mjs / image-api.mjs / sensenova.mjs
 │  ├─ video-tools.mjs / ffmpeg.mjs / video-frames.mjs
 │  ├─ pixmax-tools.mjs       # pixmax 工具 + guard + 报错引导
-│  ├─ credentials.mjs / bridge.mjs / chatgpt.mjs / job-runner.mjs / store.mjs
-└─ .state/tmp/smoke.mjs     # 117 项自动检查（gitignore，不入 git）
+│  └─ credentials.mjs / bridge.mjs / chatgpt.mjs / job-runner.mjs / store.mjs
+├─ docs/
+│  ├─ HANDOFF.md             # 本文件（agent 操作/维护类，公开）
+│  └─ agent-gpt-web.md       # 浏览器渠道生图 / 视频解析操作指南（公开）
+├─ test/
+│  └─ smoke.mjs              # 自动检查（原先在 .state/tmp/，2026-11-22 移入并入库）
+└─ .state/                   # 本地运行时数据（gitignore）
 ```
 
-`skills/`、`__*`、`.state/`、`conversations/`、`images/`、`video-frames/` 均为 gitignore 的私有材料。
+公开/私有边界见 README「公开范围」：**提示词编制类材料不公开**（`skills/`、`prompts/` 已被 `.gitignore` 排除），**agent 操作类文档公开**（`README.md`、`docs/`、`test/`）。
 
 ---
 
@@ -88,7 +93,7 @@ D:\projects\dsh-pixmax-workflow\
 
 **内置模型**：`BUILTIN_MODELS` 只有 `browser/gpt-image-2`。SenseNova 等 OpenAI 兼容端点都是 `settings.json` 里的用户模型；`sensenova` 只是 alias，端点不存在时会报「未知模型」并列出可用 id。
 
-### 本机已写入的配置（2026-11-11 22:35）
+### 本机已写入的配置（2026-11-11 22:35，路径按当时机器）
 
 | 文件 | 内容 |
 | --- | --- |
@@ -126,7 +131,7 @@ dsh plugin --profile desktop add github:bvbhu/dsh-pixmax-workflow
 # 重启 DSH 后生效
 ```
 
-本地开发可 `dsh plugin --profile <profile> add link:D:/projects/dsh-pixmax-workflow`。
+本地开发可 `dsh plugin --profile <profile> add link:D:/projects/dsh-test-plugins/dsh-pixmax-workflow`。
 
 desktop profile 的 `cordis.patch.yml` 里原有三条 `- id: pixmax-tools / video-tools / image-tools disabled: false`（早期手动启用留下的悬空覆盖）；根级行移除后已清理这 6 行，备份 `cordis.patch.yml.bak-1794419571`。
 
@@ -137,7 +142,7 @@ desktop profile 的 `cordis.patch.yml` 里原有三条 `- id: pixmax-tools / vid
 | 检查项 | 结果 |
 | --- | --- |
 | `node --check`（src + client 全部） | ✅ 0 失败 |
-| `.state/tmp/smoke.mjs` | ✅ **117/117** |
+| `node test/smoke.mjs` | ✅ 116/117（唯一失败项 `skill_install` 因沙箱内 `spawn EPERM`，非代码回归） |
 | 两个 patch 文件 YAML 解析 | ✅ 无 `config: null`；预设 15 个 plugins，无 settings 子行 |
 | preset 引用的内置包 | ✅ 全部存在于 DSH runtime |
 | 远程仓库改名 + 推送 | ✅ `bvbhu/dsh-pixmax-workflow`，main 与 origin/main 同步 |
@@ -186,5 +191,5 @@ src/pixmax-config.mjs      ~65 行   # CLI 配置文件读写
 client/pixmax-workflow-settings.js  ~570 行  # 生图模型 + CLI 路径卡片
 cordis.patch.yml           ~20 行   # 只声明 bundle 主行
 presets/ai-video-workflow.patch.yml ~90 行   # 预设声明
-README.md                 ~110 行   # 已大幅精简
+README.md                 ~140 行   # 包含「仓库结构」与「公开范围」
 ```

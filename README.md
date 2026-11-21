@@ -24,7 +24,7 @@ dsh plugin --profile desktop add github:bvbhu/dsh-pixmax-workflow
 # 重启 DSH
 ```
 
-`dsh plugin` 会同时登记依赖与 `dsh.profile.bundles`。本地开发可改用 `add link:D:/projects/dsh-pixmax-workflow`。
+`dsh plugin` 会同时登记依赖与 `dsh.profile.bundles`。本地开发可改用 `add link:D:/projects/dsh-test-plugins/dsh-pixmax-workflow`。
 
 重启后新建会话选「AI 视频工作流」即可用全部工具。**其他预设（含 `standard`）不会出现这些工具**；要在别的预设里用，把三个工具行加进那个预设的 `plugins`。
 
@@ -94,9 +94,32 @@ pixmax action="skill_install"  # 把 CLI 自带 SKILL.md + references 装进 ~/.
 
 ```powershell
 node --check src/*.mjs
-node .state/tmp/smoke.mjs    # 117/117：模型注册表、设置桥（含 CLI / 积分开关）、guard、报错引导、params 合并、工具注册
+node test/smoke.mjs    # 模型注册表、设置桥（含 CLI / 积分开关）、guard、报错引导、params 合并、工具注册
 ```
 
-`.state/`、`conversations/`、`images/`、`video-frames/`、`skills/`、`__*` 均为私有工作材料，`.gitignore` 已排除。
+## 仓库结构
+
+```
+README.md               本文件（公开）
+docs/
+  agent-gpt-web.md      agent 操作类文档：浏览器渠道生图 / 视频解析（公开）
+  HANDOFF.md            开发交接文档：真机问题、DSH 侧事实、复测清单（公开，含本机路径）
+test/
+  smoke.mjs             自动检查（读源码与 patch 文件，不需要 DSH 在场）
+src/ client/ presets/ locale/  插件本体
+cordis.patch.yml        只声明 bundle 主行
+```
+
+## 公开范围
+
+| 内容 | 是否公开 | 位置 |
+| --- | --- | --- |
+| 插件源码、`cordis.patch.yml`、`presets/`、`client/`、`locale/`、`icon.svg` | ✅ 公开 | 仓库根 |
+| agent 操作类文档（怎么用工具、怎么排错、怎么开发/交接） | ✅ 公开 | `README.md`、`docs/`、`test/` |
+| **提示词编制类材料**（提示词模板、写作指南、案头素材、个人技能文档） | ❌ 不公开 | `skills/`、`prompts/`、`*.prompt.md`（`.gitignore` 已排除） |
+| 运行时产物（`<root>/images`、对话记录、截帧、`.state/`）与 agent 草稿（`__*`） | ❌ 不入库 | 同上 |
+
+判断标准：**描述「agent 怎么操作/怎么维护」的文档可公开；描述「提示词该怎么写」的材料不公开。**
+要公开一份操作文档，放进 `docs/` 并去掉失效的个人路径；提示词编制内容不要挪进 `docs/`。
 
 > 仅供个人使用。把 ChatGPT 网页版当自动化接口批量调用不符合其服务条款取向，请自行控制频率与风险。

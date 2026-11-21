@@ -1,14 +1,22 @@
-# Private working material — never publish.
+# ---------------------------------------------------------------------------
+# 公开范围（详见 README「公开范围」）
+#   可公开：源码、README、docs/（agent 操作类文档）、test/
+#   不公开：提示词编制类材料（提示词模板 / 写作指南 / 案头素材）
+# Agent 操作文档若含失效的个人路径，请改写后放进 docs/；提示词编制内容一律留在
+# 下面的私有目录里，不要挪进 docs/，否则会被推到远程。
+# ---------------------------------------------------------------------------
 skills/
+prompts/
+*.prompt.md
 
-# Runtime / generated output
+# 运行时产物（由插件在本地生成，不入库）
 .state/
 conversations/
 images/
 video-frames/
-node_modules/
 .dsh-test/
+node_modules/
 *.log
 
-# Agent scratch
+# Agent 草稿
 __*
