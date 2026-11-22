@@ -1,0 +1,24 @@
+# dsh-subagent-model-limit bundle patch：把本插件插进 profile 的插件表。
+# 装法：`dsh plugin --profile <name> add <本目录路径或 git url>`。
+# 卸载：`dsh plugin --profile <name> remove subagent-model-limit`。
+#
+# 配置的**权威来源是插件管理页**（插件 → Subagent 模型并发上限 → 配置），
+# 它写入 `~/.dsh/subagent-model-limit/config.json`。这里的 config 只是
+# 「首次安装时的默认值」，运行时会被上面那个文件覆盖：
+#
+#   defaultLimit     未命中任何规则的模型使用的上限
+#   countMainAgent   主会话占用模型时也计数（只占名额，不拦截主会话）
+#   limits           配额表；两种写法都认：
+#                      数组：[{ provider, model, max }]        ← 设置页写的形状
+#                      对象：{ "as-one/auto": 2, "*": 4 }      ← 手写更省事
+#                    provider / model 都可写 `*` 表示全部；
+#                    匹配优先级：provider+model → provider/* → */model → */*
+#   subagentToolNames  需要拦截的工具名（工具被改过名就在这里同步）
+#   queueTimeoutMs     0 = 超限立即拒绝（默认）
+- insert:
+    - id: subagent-model-limit
+      name: 'dsh-subagent-model-limit'
+      config:
+        defaultLimit: 4
+        countMainAgent: false
+        limits: []

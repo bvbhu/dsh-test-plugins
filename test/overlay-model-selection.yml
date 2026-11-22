@@ -1,0 +1,41 @@
+# 临时 overlay：验证「按模型限制 subagent 并发」。
+# 用 `dsh --profile web --patch <本文件> ...` 加载，不写进 profile 的持久配置。
+#
+# 三件事：
+#   1. tool-subagent 开 modelSelection —— 让工具接受 provider/model 参数；
+#   2. subagent-model-selection-settings 记录 policy —— 否则显式选择只能等于父路由
+#      （dsh-tool-subagent/src/model-selection.ts:142）；
+#   3. dsh-subagent-model-limit 的配额 —— 这里把 as-one/auto 压到 1，
+#      用来验证「父会话是 deepseek-flash 时，创建一个 auto 子代理后第二个 auto 会被拒」。
+#
+# ⚠️ policy 只在**新建的顶层 Session** 上记录，改完要开新会话。
+
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: subagent
+    modelSelection: true
+    modelDiscovery: true
+
+- id: subagent-model-selection-settings
+  name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
+  config:
+    enabled: true
+    allowedModels:
+      - provider: as-one
+        model: deepseek-flash
+      - provider: as-one
+        model: auto
+      - provider: as-one
+        model: minimax-flash
+
+- id: subagent-model-limit
+  name: dsh-subagent-model-limit
+  config:
+    defaultLimit: 4
+    limits:
+      # 故意压到 1：第二个同模型子代理必须被拒。
+      as-one/auto: 1
+      # 父会话模型给 2，用来对比「不同模型各自独立的配额」。
+      as-one/deepseek-flash: 2

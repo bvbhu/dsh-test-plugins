@@ -1,0 +1,4 @@
+node_modules/
+.fake.pid
+*.log
+.DS_Store
