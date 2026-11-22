@@ -127,7 +127,7 @@ describe("图像桥:逐张桥接", () => {
     expect(key).not.toBeNull();
   });
 
-  it("历史图未缓存 → 静默删块(不写占位)", async () => {
+  it("历史图未缓存 → 原样保留(不扔图、不写占位;折叠交给外层 bili)", async () => {
     parseCacheClear();
     const msgs: BridgeMessage[] = [
       userMsg([imgPart()]),
@@ -138,9 +138,13 @@ describe("图像桥:逐张桥接", () => {
       parseOne: async () => "证据",
       chainHasVision: false,
     });
-    expect(out.result.droppedHistory).toBe(1);
+    // 2026-11-22 定案:as-one 只桥本轮图,历史图原样透传,丢弃/折叠交给 bili。
+    expect(out.result.droppedHistory).toBe(0);
     expect(out.result.replaced).toBe(0);
-    // 最后那条 user(字符串)没被改。
+    expect(out.result.parsedNow).toBe(0);
+    // 历史图块原地未动(仍是 image_url),本轮 user(字符串)也没被改。
+    const first = out.messages[0].content as ContentPart[];
+    expect(first[0].type).toBe("image_url");
     expect(out.messages[2].content).toBe("继续");
   });
 
