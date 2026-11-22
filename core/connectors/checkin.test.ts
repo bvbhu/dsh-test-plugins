@@ -30,6 +30,7 @@ import {
   WB_CHECKIN_STATUS_PATH,
   WB_CHECKIN_CLAIM_PATH,
   resolveTraeDevice,
+  isTraeAuthFailure,
   isRetryableCheckinFailure,
   isTransientCheckinError,
   checkinBackoffMs,
@@ -285,8 +286,60 @@ describe("traeCheckinClaim(confirm 语义:false 恒为零写请求)", () => {
     expect(r.claimed).toBe(false);
     expect(r.enabled).toBe(false);
     expect(r.would_claim).toBe(false);
+    expect(r.auth_failed).toBeFalsy();
     expect(r.message).toBe("该账号未启用签到");
     expect(calls).toHaveLength(1);
+  });
+
+  it("登录失效(200 + code 1001 + enable:false)→ auth_failed,不是「未启用」", async () => {
+    // 实测原文(2026-11-22):上游**不用 401**,而是 200 + code 1001 + enable:false。
+    const { fetchFn, calls } = makeFetch(() =>
+      STATUS_OK({
+        checked_in: false,
+        code: 1001,
+        enable: false,
+        message:
+          "We're sorry, but we are not able to authenticate you. If you continue to experience issues, please contact our support team for assistance.",
+      }),
+    );
+    const r = await traeCheckinClaim(traeAccount(), { fetchFn, confirm: true });
+    expect(r.claimed).toBe(false);
+    expect(r.auth_failed).toBe(true);
+    expect(r.enabled).toBe(false);
+    expect(r.code).toBe(1001);
+    expect(r.message).toContain("登录已失效");
+    expect(r.message).toContain("1001");
+    expect(r.message).toContain("重新登录");
+    // 零写请求:只打了 status 一次。
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain(TRAE_CHECKIN_STATUS_PATH);
+  });
+
+  it("认证类文案兜底:码不是 1001 但 message 说 authenticate 也算登录失效", async () => {
+    const { fetchFn } = makeFetch(() =>
+      STATUS_OK({ checked_in: false, code: 4003, enable: false, message: "We are unable to authenticate you." }),
+    );
+    const r = await traeCheckinClaim(traeAccount(), { fetchFn, confirm: true });
+    expect(r.auth_failed).toBe(true);
+    expect(r.message).toContain("登录已失效");
+  });
+
+  it("真「未启用」但带上游 code → 文案把 code/原文带出来(以前一律丢掉)", async () => {
+    const { fetchFn } = makeFetch(() =>
+      STATUS_OK({ checked_in: false, code: 9001, enable: false, message: "activity not started" }),
+    );
+    const r = await traeCheckinClaim(traeAccount(), { fetchFn, confirm: true });
+    expect(r.auth_failed).toBeFalsy();
+    expect(r.message).toContain("该账号未启用签到");
+    expect(r.message).toContain("9001");
+    expect(r.message).toContain("activity not started");
+  });
+
+  it("isTraeAuthFailure:码优先,文案兜底", () => {
+    expect(isTraeAuthFailure(1001, "")).toBe(true);
+    expect(isTraeAuthFailure(null, "not able to authenticate you")).toBe(true);
+    expect(isTraeAuthFailure(0, "success")).toBe(false);
+    expect(isTraeAuthFailure(9004, "device id required")).toBe(false);
   });
 
   it("confirm=true 且可签 → POST claim 领取;成功后重查 status(共 3 个请求)", async () => {

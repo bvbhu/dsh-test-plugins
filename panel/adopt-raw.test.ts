@@ -16,26 +16,19 @@
  */
 import { describe, expect, it } from "vitest";
 
-/** 与 channels-methods.ts 的 adopt raw 构造同口径(纯逻辑抽取)。 */
+import { adoptVaultFields } from "./adopt-fields.js";
+
+/**
+ * 以前这里手抄了一份「同口径」的构造逻辑——两份实现会各自漂移
+ * （2026-11-22 的 `expires_at` / `refresh_secret` 缺陷就是这么漏掉的）。
+ * 现在直接调生产函数 `adoptVaultFields`，测试与实现同源。
+ */
 function buildAdoptRaw(opts: {
   nowSec: number;
   region?: string;
   extra?: Record<string, unknown>;
 }): Record<string, unknown> {
-  const raw: Record<string, unknown> = {
-    source: "discover",
-    // ⚠️ wallNow() 返回秒 → 必须 ×1000 才能填 _ms 字段
-    adopted_at_ms: Math.round(opts.nowSec * 1000),
-  };
-  if (opts.region) raw.region = String(opts.region);
-  if (opts.extra !== undefined && opts.extra !== null) {
-    for (const [k, v] of Object.entries(opts.extra)) {
-      if (v === undefined || v === null || v === "") continue;
-      if (k === "provider" || k === "token" || k === "region") continue;
-      raw[k] = v;
-    }
-  }
-  return raw;
+  return adoptVaultFields(opts).raw;
 }
 
 describe("adopt raw 构造", () => {

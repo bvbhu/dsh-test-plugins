@@ -42,13 +42,13 @@ import {
   checkinSupported,
   CheckinRegionError,
   CheckinCredentialError,
-  TRAE_CODE_CROWDED,
   traeCheckinStatus,
   traeCheckinClaim,
   wbCheckinStatus,
   wbCheckinClaim,
   wbRegionOf as checkinWbRegionOf,
 } from "@as-one/core/src/connectors/checkin.js";
+import { traeClaimMessageOf, traeClaimStatusOf } from "./trae-claim-status.js";
 import { MINIMAX_QUOTA_TIMEOUT_MS } from "@as-one/core/src/collector/quota.js";
 import {
   minimaxSigninClaim,
@@ -765,27 +765,12 @@ export function createChannelsDomain(
           },
           { baseUrl: base ?? undefined, confirm },
         );
-        const status: CheckinClaimRow["status"] = res.claimed
-          ? "claimed"
-          : res.already_checked_in || res.device_checked_in
-            ? "already"
-            : !res.enabled
-              ? "skipped"
-              : res.would_claim
-                ? "dry_run"
-                : "failed";
+        const status: CheckinClaimRow["status"] = traeClaimStatusOf(res);
         // 领取成功要说清领到了什么(「签到成功没有提示」的一半原因就是这行只有
         // 一个「领取成功」,页面拿到后也没什么可展示的)。
-        // ⚠️ **9074(上游拥挤)要给出可操作的下一步**(2026-11-09):用户看到
-        // 「当前参与用户太多,请稍后再试(已重试 3 次仍失败)」会以为签到坏了。
-        // 其实这是上游高峰限流 —— 隔几分钟再点一次就好,账号本身没问题。
-        const crowded = !res.claimed && res.code === TRAE_CODE_CROWDED;
-        const message = res.claimed
-          ? `领取成功${res.checkin.credits > 0 ? `,当前积分 ${res.checkin.credits}` : ""}${
-              res.retries > 0 ? `(上游拥挤,重试 ${res.retries} 次后成功)` : ""}`
-          : crowded
-            ? "上游当前拥挤(高峰限流),稍后重试即可 —— 账号本身没有问题"
-            : res.message;
+        // ⚠️ 9074(上游拥挤)/ 1001(登录失效)的文案与「auth_failed 必须排在
+        // !enabled 之前」这条顺序,都在 `trae-claim-status.ts` 里并带单测。
+        const message = traeClaimMessageOf(res);
         return {
           ...baseRow,
           status,
