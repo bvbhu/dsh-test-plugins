@@ -1,0 +1,49 @@
+# dsh-quilt-compact: cooperative compaction interceptor.
+#
+# This patch deliberately does NOT disable `compaction-basic` and does NOT
+# restate/override `preset-standard`. The host keeps its built-in compaction
+# engine, triggers, surface selection, durable transaction, and shrink check.
+# dsh-quilt-compact only intercepts `llm/stream` calls whose
+# `purpose === 'compaction'` and replaces the single monolithic summary call
+# with a tiered chunk -> merge pipeline plus a session-search anchor block.
+#
+# The interceptor is a GLOBAL llm/stream listener, so one host-plane row is
+# enough for both headless and web/desktop profiles: it is not a `compaction`
+# service, so it does not need to live inside the agent preset's isolate group.
+#
+# Compaction-only model pool. Routes are ordinary DSH provider/model routes,
+# so dsh-connect-* style plugins keep working: they register adapters in the
+# same llm service this pool dispatches through. Never register an adapter and
+# never rewrite the routed request here.
+
+- insert:
+    - id: dsh-quilt-compact
+      name: 'dsh-quilt-compact/intercept'
+      config:
+        # Fraction of a model's usable input budget one chunk may occupy.
+        chunkRatio: 0.8
+        # Overlap between adjacent chunks, as a fraction of the chunk budget.
+        chunkOverlapRatio: 0.1
+        # Session-model fallback when no pool route can serve a job.
+        fallbackToSessionModel: true
+        # Optional suffixes appended to the chunk / merge prompts.
+        chunkPromptSuffix: ''
+        mergePromptSuffix: ''
+        # Maximum prompt size handed to the final merge call (tokens).
+        mergeMaxContextTokens: 128000
+        # Ordered model pool. Each route key (`provider/model`) must be unique;
+        # cooldownHours is measured from the failure (positive, decimals allowed).
+        tiers:
+          - name: primary
+            models:
+              - provider: openrouter
+                model: openrouter/free
+                maxConcurrent: 1
+                cooldownHours: 1
+        # Stage 0 preprocessing over the replayed region. Destructive transforms
+        # stay off by default: the chunker owns length control.
+        preprocessing:
+          dedup: true
+          purgeErrors: true
+          astSkeleton: { enabled: false, maxDepth: 2 }
+          logCondense: { mode: balanced, maxLines: 200 }
