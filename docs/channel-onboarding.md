@@ -2,7 +2,7 @@
 
 > 面向：要在 As One 里接入上游模型渠道的使用者与 agent。
 > 目标：说清**每个渠道需要什么凭据、你必须亲手做什么、以及最容易踩的坑**。
-> 代码依据：`core/connectors/*`、`core/collector/*`、`scripts/*-login.mjs`（截至 0.5.1）。
+> 代码依据：`core/connectors/*`、`core/collector/*`、`scripts/*-login.mjs`（截至 0.5.2）。
 
 ---
 
