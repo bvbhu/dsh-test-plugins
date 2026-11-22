@@ -1,0 +1,48 @@
+{
+  "name": "dsh-local-app",
+  "version": "0.1.0",
+  "description": "启动本地指定进程，用正则逐行抓取它输出里的 URL（含 key/token），并在 DSH 页面里渲染该页面。侧栏 / 插件配置页 / 设置页三处入口。",
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "meta": {
+    "title": "本地应用",
+    "description": "启动本地指定进程，抓取其输出里的 URL，在 DSH 中渲染该页面。"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "local-app",
+    "webview",
+    "iframe"
+  ],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

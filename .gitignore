@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.DS_Store
+.fake.pid
+
+# Runtime state written by the supervisor (if a root is pointed at the repo)
+.state/
+*.dsh-test/

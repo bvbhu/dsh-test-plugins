@@ -1,0 +1,21 @@
+# dsh-local-app bundle patch
+#
+# 标准 bundle 自挂载：`dsh plugin --profile <name> add <本目录>` 之后，本包进入
+# profile 的 dsh.profile.bundles，重启后这里把插件行插入 loader 树。
+#
+# 行的 `name` 必须是包名原样：它既是 Host 半的 Node 导入说明符（经 package main
+# 解析到 lib/index.js），也是 dsh-client-modules 扫描“浏览器半”的键（经
+# exports["./client"] 解析到 lib/client.js，见本包 dsh.client 声明）——所以
+# Host / Client 两个半共享这一行即可，无需第二个 loader 行。
+#
+# `id` 是稳定身份：profile 用户层用该 id 做“id 定向覆盖”即可合并自定义 config：
+#   - id: dsh-local-app
+#     config:
+#       argv: ["python", "-m", "http.server", "4000"]
+#       cwd: "D:/apps/mine"
+#       urlExtractRegex: '(?<url>https?://\S+)'
+# ⚠️ patch 的 config 是**整行替换**（不深合并）：覆盖时必须把想保留的字段一并写全。
+#   不写 config 时全部走插件 Config schema 的默认值。
+- insert:
+    - id: dsh-local-app
+      name: 'dsh-local-app'
