@@ -95,6 +95,34 @@ export const TRAE_CODE_DEVICE_ALREADY = 9095;
  * 签到坏了、甚至怀疑账号被封。
  */
 export const TRAE_CODE_CROWDED = 9074;
+/**
+ * 上游判「认证失败/登录已失效」的业务码。
+ *
+ * ⚠️ 实测(2026-11-22):上游**不用 401**,而是 `HTTP 200` +
+ * `{"checked_in":false,"code":1001,"enable":false,"message":"We're sorry,
+ * but we are not able to authenticate you. …"}`。只按 HTTP 状态分类就会把
+ * 「登录已失效」当成「签到未启用」,面板再压成「该渠道今日无签到活动」——
+ * 用户会以为上游取消活动,而真因是凭证过期。
+ */
+export const TRAE_CODE_AUTH_FAILED = 1001;
+
+/** 判定「认证失败」的文案线索(码优先;文案兜底,兼容上游改文案)。 */
+const TRAE_AUTH_HINTS = [
+  "not able to authenticate",
+  "unable to authenticate",
+  "authenticate you",
+  "unauthorized",
+  "登录失效",
+  "重新登录",
+] as const;
+
+/** 上游这次 status 应答是不是「认证失败」而不是「未启用签到」。 */
+export function isTraeAuthFailure(code: number | null, message: string): boolean {
+  if (code === TRAE_CODE_AUTH_FAILED) return true;
+  const m = (message ?? "").toLowerCase();
+  return TRAE_AUTH_HINTS.some((h) => m.includes(h.toLowerCase()));
+}
+
 export const TRAE_CHECKIN_TIMEOUT_MS = 15_000;
 
 // ---------------------------------------------------------------------------
@@ -437,6 +465,11 @@ export interface TraeClaimResult {
   would_claim: boolean;
   already_checked_in?: boolean;
   device_checked_in?: boolean;
+  /**
+   * true = 上游判「认证失败/登录已失效」(HTTP 200 + `code 1001`),**不是**
+   * 「未启用签到」。调用方必须把它当失败展示(提示重新登录),不能当 skipped。
+   */
+  auth_failed?: boolean;
   code: number | null;
   message: string;
   checkin: TraeStatus;
@@ -467,7 +500,35 @@ export async function traeCheckinClaim(
       Partial<TraeClaimResult>,
   ): TraeClaimResult => ({ attempts: 0, retries: 0, ...base, ...over });
   if (status.enable === false) {
-    return settled({ claimed: false, enabled: false, would_claim: false, code: null, message: "该账号未启用签到", checkin: status });
+    // ⚠️ 上游用「200 + code 1001 + enable:false」表达**登录失效**（2026-11-22 实测）。
+    // 若这一支落到 enabled:false，上层会把它当「无签到活动」，用户永远看不到真因。
+    if (isTraeAuthFailure(status.code, status.message)) {
+      return settled({
+        claimed: false,
+        enabled: false,
+        would_claim: false,
+        auth_failed: true,
+        code: status.code,
+        message:
+          `登录已失效(上游 code ${status.code ?? "?"}` +
+          `${status.message ? `:${status.message}` : ""}) —— ` +
+          "请在 Trae 客户端重新登录后重新导入账号",
+        checkin: status,
+      });
+    }
+    // 真的「未启用」才走这里；顺带把上游 code/文案带出来（以前一律丢掉，用户看不到原因）。
+    const detail =
+      (status.code !== null && status.code !== 0) || status.message !== ""
+        ? `(上游 code ${status.code ?? "?"}${status.message ? `:${status.message}` : ""})`
+        : "";
+    return settled({
+      claimed: false,
+      enabled: false,
+      would_claim: false,
+      code: status.code,
+      message: `该账号未启用签到${detail}`,
+      checkin: status,
+    });
   }
   if (status.checked_in) {
     return settled({ claimed: false, enabled: true, would_claim: false, already_checked_in: true, code: null, message: "今日已签到", checkin: status });

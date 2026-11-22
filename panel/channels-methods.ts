@@ -15,6 +15,7 @@
  */
 
 import { join } from "node:path";
+import { adoptVaultFields } from "./adopt-fields.js";
 import { quotaHub, type QuotaHub } from "@as-one/core/src/datahub/index.js";
 
 import type {
@@ -428,7 +429,7 @@ export function createChannelsMethods(ctx: PanelContext, deps: ChannelsMethodsDe
       } else if (summary.failed > 0) {
         part = `签到失败:${summary.errors[0] ?? "未知原因"}`;
       } else {
-        part = "该渠道今日无签到活动(未领取)";
+        part = "该渠道今日未领取(各账号被跳过,原因见渠道页各行)";
       }
     }
     return { summary, part };
@@ -1286,7 +1287,7 @@ export function createChannelsMethods(ctx: PanelContext, deps: ChannelsMethodsDe
         message =
           failedRows.length > 0
             ? `签到失败:${failedRows[0].message}`.slice(0, 300)
-            : "该渠道今日无签到活动(未领取)";
+            : "该渠道今日未领取(各账号被跳过,原因见渠道页各行)";
       } else {
         message = "该渠道没有可用账号";
       }
@@ -1720,22 +1721,12 @@ export function createChannelsMethods(ctx: PanelContext, deps: ChannelsMethodsDe
       if (!pid || !name || !tok) {
         return { ok: false, provider: pid, message: "adopt 需要 provider/username/token" };
       }
-      // ⚠️ `wallNow()` 返回**秒**,而字段名是 `_ms` —— 必须 ×1000,
-      // 否则按毫秒解析会落到 1970 年(实测 bug:1970-01-22 02:21:08)。
-      const raw: Record<string, unknown> = {
-        source: "discover",
-        adopted_at_ms: Math.round(wallNow() * 1000),
-      };
-      if (region) raw.region = String(region);
-      // 发现阶段的身份字段整包透传(不含 provider/token —— token 走 secret 列,
-      // 不该在 raw 里留第二份明文)。region 已在上面按入参写过,这里不覆盖。
-      if (extra !== undefined && extra !== null) {
-        for (const [k, v] of Object.entries(extra)) {
-          if (v === undefined || v === null || v === "") continue;
-          if (k === "provider" || k === "token" || k === "region") continue;
-          raw[k] = v;
-        }
-      }
+      // ⚠️ 字段构造统一走 `adopt-fields.ts`（纯函数 + 单测）：它负责三件事 ——
+      // 身份字段整包透传（不含 token）、到期时间毫秒→秒、refresh token 落
+      // `refresh_secret`。少了后两个，采纳后的账号会「令牌新、过期旧、永不自动续期」
+      // （2026-11-22 实测事故：库里 11-08 的旧令牌一直没被替换，直到签到回 code 1001）。
+      const fields = adoptVaultFields({ nowSec: wallNow(), region, extra });
+      const raw = fields.raw;
       // ⚠️ 2026-11-08(A4):**先自检,再入池**。
       //
       // 为什么放在接入这一步:凭据一进库,调度器就会把它当可用端点 ——
@@ -1766,7 +1757,15 @@ export function createChannelsMethods(ctx: PanelContext, deps: ChannelsMethodsDe
         raw.selfcheck = { verdict: verdict.verdict, atMs: wallNow() };
       }
       // adopt:只新增、按 username 合并(vault.put 对 undefined 字段保留原值)。
-      await ctx.vault.put({ provider: pid, username: name, secret: tok, raw });
+      await ctx.vault.put({
+        provider: pid,
+        username: name,
+        secret: tok,
+        // undefined = 保留库里原值（不拿 null 去清空）。
+        refreshSecret: fields.refreshSecret,
+        expiresAt: fields.expiresAt,
+        raw,
+      });
       ctx.syncRegistry(); // 新凭据 = 新账户行,索引要跟上
       return {
         ok: true,
