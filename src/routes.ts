@@ -34,6 +34,7 @@ import {
 } from "@as-one/core/src/gateway/request-fields.js";
 import type { AsOneWebRoute } from "./context-types.js";
 import { readJsonBody, toUpstreamRequest, writeJson } from "./wire.js";
+import { applyApiInterface } from "./components/api-interface/index.js";
 import type { AsOneRuntime } from "./setup.js";
 import {
   isWorkbuddyBanMessage,
@@ -190,6 +191,40 @@ export function buildGatewayRoutes(
     });
     return true;
   };
+
+  /**
+   * 对外 API 接口（chat / messages 两个 handler 的装配）。
+   *
+   * ⚠️ 这里只用 `messages` 那一条：`/v1/chat/completions` 的宿主路由保留了
+   * DSH 专有行为（预热顺序、熔断位置、请求明细口径都是 desktop 侧 parity 的
+   * 产物），**不**随核心网关的 chat handler 一起换实现。组件把两个 handler
+   * 装在一起，是为了让「对外 API」只有一份契约；chat 的宿主实现是后续独立迁移。
+   */
+  const api = applyApiInterface({
+    resolveUpstream: (model) => rt.resolveUpstream(model),
+    // 会话派生沿用宿主口径：Anthropic 的 messages 里 `content[].text` 与 chat 的
+    // 文本块对 `sessionIdOf` 同形，所以两种入站共享同一个派生结果。
+    deriveSessionId: (body) => sessionIdOf(body, String(body.model ?? "")) ?? undefined,
+    // 额度预热：必须在 resolveUpstream（内部就是 scheduler.chain()）之前完成。
+    beforeResolve: awaitWarmup,
+    // 渠道级熔断：与 chat 路由同一判据（模型前缀 + 逻辑模型成员）。
+    guard: (model, _req, res) =>
+      (model.startsWith("workbuddy/") || modelIncludesWorkbuddyMember(model)) &&
+      rejectIfBreakerTripped(res),
+    // 上游报「账号异常行为」时与 chat 路由一样彻底熔断该渠道。
+    onFailure: async (exc) => {
+      if (exc instanceof UpstreamError && isWorkbuddyBanMessage(exc.message)) {
+        await tripBreakerQuietly(exc.message);
+      }
+    },
+    logger,
+    onRequestDone: done,
+  });
+  const messagesRoute = api.routeOf("/v1/messages");
+  if (messagesRoute === undefined) {
+    // 装配错误必须在启动时炸出来，而不是让某个请求 404。
+    throw new Error("[as-one] api-interface 未装配 /v1/messages 路由");
+  }
 
   return [
     {
@@ -365,6 +400,42 @@ export function buildGatewayRoutes(
             discarded_fields: discarded,
             request: body,
           });
+        }
+      },
+    },
+    {
+      kind: "exact",
+      path: "/v1/messages",
+      /**
+       * Anthropic Messages 入站（组件 `api-interface/message.ts`）。
+       *
+       * 鉴权与 chat 同一套（`authGuard` → `requireKey`）；错误体沿用仓库约定
+       * `{"detail": {error: {type, message}}}`。流式事件与断开语义由组件负责，
+       * 这里只管宿主面的方法判定与错误出口。
+       */
+      handler: async (req, res) => {
+        const nreq = req as unknown as IncomingMessage;
+        const nres = res as unknown as ServerResponse;
+        if ((nreq.method ?? "POST").toUpperCase() !== "POST") {
+          writeJson(nres, 405, { detail: `Method Not Allowed: ${nreq.method} POST` });
+          return;
+        }
+        if (authGuard(nreq, nres)) return;
+        try {
+          await messagesRoute.handle(nreq, nres);
+        } catch (exc) {
+          const mapped =
+            exc instanceof GatewayHttpError
+              ? exc
+              : exc instanceof UpstreamError
+                ? upstreamErrorToHttp(exc)
+                : null;
+          if (mapped) {
+            writeJson(nres, mapped.status, mapped.body, mapped.headers, mapped.rawBody);
+          } else {
+            logger.error?.("[as-one] messages internal error", exc);
+            writeJson(nres, 500, { detail: "Internal Server Error" });
+          }
         }
       },
     },
