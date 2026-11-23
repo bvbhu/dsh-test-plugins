@@ -97,3 +97,114 @@ describe("client_disconnected 是瞬时不冷却失败", () => {
     expect(rec.lastKind).toBe("");
   });
 });
+
+/**
+ * 回归：「瞬时错误不要进冷却」—— 但上游**明确给的** `Retry-After` 仍然算数
+ * （2026-11-23 用户 m03723，定案为折中口径）。
+ *
+ * 故障链：超时/连接类失败(`TRANSIENT_KINDS`)本该只记账不熔断，但
+ * `gateway-upstream` 两处 `router.finish` 都把 `cooldownUntil: cooldownUntilOf(gerr)`
+ * 传下来 —— 而 `cooldownUntilOf` 只看 `retryAfter` 有没有，**不看 kind**。
+ * 只要上游在 503/504 上带了个 `Retry-After`，`hint.until` 就落在
+ * `noteFailure` 的第一优先级分支，在瞬时豁免之前 `return`，把端点打进冷却。
+ *
+ * 口径（折中，2026-11-23 用户定案）：
+ * - 上游**明确**给的恢复时刻（`hint.untilSource === "upstream"`）压过瞬时豁免 ——
+ *   上游都说「到 X 之前别来」了，就没有「这是瞬时抖动」的解释空间（这是继承
+ *   自 Python 时代的原口径，`router.test.ts` 的「明确恢复时刻」用例保的就是它）。
+ * - **网关自己推算**的时刻（缺省 `"gateway"`）压不过豁免 —— 那种推算没有上游
+ *   背书，不该让一次网络抖动换来整段冷却。
+ */
+describe("瞬时错误与上游 Retry-After 的边界", () => {
+  it("timeout + 网关推算的 until → 不冷却", () => {
+    const rec = noteFailure(health(), {
+      kind: "timeout",
+      status: 504,
+      error: "上游超时",
+      now: NOW,
+      hint: { until: NOW + 30, policy: POLICY, untilSource: "gateway" },
+    });
+    expect(rec.fails).toBe(1);
+    expect(rec.lastKind).toBe("timeout");
+    expect(rec.cooldownUntil).toBe(0);
+  });
+
+  it("connection + 网关推算的 until → 不冷却", () => {
+    const rec = noteFailure(health(), {
+      kind: "connection",
+      status: 502,
+      error: "read ECONNRESET",
+      now: NOW,
+      hint: { until: NOW + 30, policy: POLICY, untilSource: "gateway" },
+    });
+    expect(rec.cooldownUntil).toBe(0);
+  });
+
+  it("client_disconnected + 网关推算的 until → 不冷却", () => {
+    const rec = noteFailure(health(), {
+      kind: "client_disconnected",
+      status: 0,
+      error: "客户端断开",
+      now: NOW,
+      hint: { until: NOW + 30, policy: POLICY, untilSource: "gateway" },
+    });
+    expect(rec.cooldownUntil).toBe(0);
+  });
+
+  it("untilSource 缺省按 gateway → 瞬时错误照旧不冷却", () => {
+    // 保守缺省:没标来源的时刻不享受上游权威。
+    const rec = noteFailure(health(), {
+      kind: "timeout",
+      status: 504,
+      error: "上游超时",
+      now: NOW,
+      hint: { until: NOW + 30, policy: POLICY },
+    });
+    expect(rec.cooldownUntil).toBe(0);
+  });
+
+  it("瞬时错误也不清零已有冷却", () => {
+    const cooling = health({ cooldownUntil: NOW + 600 });
+    const rec = noteFailure(cooling, {
+      kind: "timeout",
+      status: 504,
+      error: "上游超时",
+      now: NOW,
+      hint: { until: NOW + 30, policy: POLICY, untilSource: "gateway" },
+    });
+    expect(rec.cooldownUntil).toBe(NOW + 600);
+  });
+
+  it("保留原口径:timeout + 上游明确的 until → 照样冷到那一刻", () => {
+    const rec = noteFailure(health(), {
+      kind: "timeout",
+      status: 504,
+      error: "上游超时",
+      now: NOW,
+      hint: { until: NOW + 120, policy: POLICY, untilSource: "upstream" },
+    });
+    expect(rec.cooldownUntil).toBe(NOW + 120);
+  });
+
+  it("对照：非瞬时的 rate_limit + until 仍按上游时刻冷却", () => {
+    const rec = noteFailure(health(), {
+      kind: "rate_limit",
+      status: 429,
+      error: "上游限流",
+      now: NOW,
+      hint: { until: NOW + 30, policy: POLICY, untilSource: "upstream" },
+    });
+    expect(rec.cooldownUntil).toBe(NOW + 30);
+  });
+
+  it("对照：非瞬时的 upstream + until 仍按上游时刻冷却", () => {
+    const rec = noteFailure(health(), {
+      kind: "upstream",
+      status: 503,
+      error: "Service Unavailable",
+      now: NOW,
+      hint: { until: NOW + 30, policy: POLICY, untilSource: "upstream" },
+    });
+    expect(rec.cooldownUntil).toBe(NOW + 30);
+  });
+});

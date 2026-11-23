@@ -1136,7 +1136,10 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
               latencyMs: Math.round(performance.now() - t0),
               // 上游给了 retry_after 就按它冷却(优先按上游给出的时间);
               // 没给 → undefined,回落 provider 覆盖 / 全局 floor。
+              // `cooldownUntilOf` 只在上游真给了 `Retry-After` 时返回时刻,
+              // 所以这里标 `"upstream"` —— 它才有资格压过瞬时故障豁免。
               cooldownUntil: firstChunkEmitted || overflow || channelReject ? undefined : cooldownUntilOf(gerr),
+              cooldownUntilSource: "upstream",
             });
             // ⚠️ **凭据类失败 → 通知装配层后台换 key**(用户 m16528)。
             //    这里是**不阻塞**的:换 key 要登录 + 建 key + 等 IAM 传播
@@ -1555,6 +1558,8 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
               kind: gerr.kind,
               latencyMs: Math.round(performance.now() - t0),
               cooldownUntil: overflow || channelReject ? undefined : cooldownUntilOf(gerr),
+              // 与 stream() 同口径:只有上游真给了 `Retry-After` 才标 upstream。
+              cooldownUntilSource: "upstream",
             });
             // ⚠️ 与 stream() 同口径:凭据类失败 → 后台换 key(不阻塞)。
             if (gerr.kind === UpstreamErrorKind.Auth && item.endpoint.provider === "sensenova") {
