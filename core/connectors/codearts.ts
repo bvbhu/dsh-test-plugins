@@ -326,9 +326,12 @@ export class CodeartsAdapter {
       return new UpstreamError("upstream", "CodeArts 上游返回成功", false, httpStatus, undefined, raw);
     }
     if (httpStatus === 401 || httpStatus === 403) {
+      // CodeArts 走 AK/SK 签名网关(推理与签到同一份凭据),没有 Cookie 登录态。
+      // 401/403 表示上游拒绝了这份签名凭据:IAM AK/SK 被禁用/轮换,或 STS 临时
+      // 凭据过期。文案如实描述,不再误导用户去"重新登录"。
       return new UpstreamError(
         "auth",
-        "CodeArts 登录态失效，请重新登录 CodeArts",
+        `CodeArts AK/SK 鉴权失败（上游 HTTP ${httpStatus}）：请检查 accessKey/secretKey 是否正确、是否被禁用或轮换；若用的是 STS 临时凭据请重新导入（含 securityToken）`,
         false,
         httpStatus,
         undefined,
