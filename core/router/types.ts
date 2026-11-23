@@ -67,6 +67,9 @@ export type UpstreamErrorKindName =
  * ⚠️ 不含 `upstream`(5xx):那是上游自己出了问题,可能持续一段时间。也不含
  * `alreadyStreaming`:流已开始,换端点救不了这一轮。
  *
+ * ⚠️ 豁免**压过上游给的 `Retry-After`**(2026-11-23 用户 m03723):`until` 曾排在
+ * 豁免之前,导致带 `Retry-After` 的超时/连接错误照样落冷却。
+ *
  * ⚠️ 2026-11-17 补入 `client_disconnected`（用户报「手动打断会话也会让模型进
  * 冷却」）：客户端打断 = **用户主动放弃这次对话**，端点全程没有失败 —— 上游可能
  * 正常吐了半个流，是我们这头掐的。按失败记账会给无辜端点白记一次连续失败并落
@@ -293,6 +296,19 @@ export interface CooldownHint {
    * 不跟 `now + floor` 取 max(取 max 会把上游给的更短时刻悄悄拉长)。
    */
   until: number | null;
+  /**
+   * `until` 的**出处** —— 决定它压不压得过「瞬时故障不冷却」。
+   *
+   * - `"upstream"`:`until` 来自上游**明确**给的恢复时刻(`Retry-After` 头、
+   *   503 body 里的 `retry_after`)。上游都明说「到 X 之前别来」了,就没有
+   *   「这是瞬时抖动」的解释空间 —— **即便 kind 属瞬时故障也照落冷却**。
+   * - `"gateway"`(缺省):`until` 是**本网关自己推算**的(按退避序列外推、
+   *   按策略兜底等)。这种推算没有上游背书,瞬时故障的豁免照样压过它。
+   *
+   * 缺省 `"gateway"` —— 保守起见:没有明确标注来源的时刻不享受上游权威。
+   * 2026-11-23 用户 m03723 定案(折中口径)。
+   */
+  untilSource?: "upstream" | "gateway";
   /** 本次请求的重试策略;`null` = 以 0 秒进冷却(等价于「不熔断」)。 */
   policy: RetryPolicy | null;
 }
@@ -301,14 +317,25 @@ export interface CooldownHint {
  * `EndpointHealth` 上的一次失败记账。**纯函数**(不读墙钟 —— 时间由调用方给)。
  *
  * 优先级(高 → 低):
- * 1. **上游显式指定** —— `hint.until`,绝对墙钟 epoch 秒(由 `Retry-After` 头算出);
- * 2. **供应商覆盖 / 全局默认** —— `hint.policy.cooldownFloorS`;
- * 3. 都没有 → `now + 0`(不熔断)。
+ * 1. **上游显式恢复时刻** —— `hint.until` 且 `hint.untilSource === "upstream"`:
+ *    直接落,**压过瞬时豁免**(见下);
+ * 2. **瞬时豁免** —— `kind ∈ TRANSIENT_KINDS` 只记账,**不落 `cooldownUntil`**
+ *    (此时 `hint.until` 若属网关推算则一并丢弃);
+ * 3. **网关推算的 `until`** —— `hint.until` 且来源是 `"gateway"`(缺省);
+ * 4. **供应商覆盖 / 全局默认** —— `hint.policy.cooldownFloorS`;
+ * 5. 都没有 → `now + 0`(不熔断)。
  *
- * ⚠️ **已知的明确瞬时故障不冷却**:`timeout` / `connection` 只记账
- * (`fails` / `lastError` / `lastKind` / `lastStatus` 照旧更新),**不落
- * `cooldownUntil`**。例外:`hint.until` 仍然优先 —— 上游都明说「到 X 之前别来」
- * 了,就没有「这是瞬时抖动」的解释空间;`already_streaming` 也不豁免。
+ * ⚠️ **已知的明确瞬时故障不冷却**:`timeout` / `connection` / `client_disconnected`
+ * 只记账(`fails` / `lastError` / `lastKind` / `lastStatus` 照旧更新),**不落
+ * `cooldownUntil`**。`already_streaming` 不豁免。
+ *
+ * ⚠️ **瞬时豁免 vs 上游 `Retry-After` 的边界**(2026-11-23 用户 m03723
+ * 「瞬时错误不要进冷却」,定案为折中口径):
+ * 只有**上游明确给出**的恢复时刻才能压过豁免 —— 上游明说「到 X 之前别来」了,
+ * 就没有「这是瞬时抖动」的解释空间,这是继承自 Python 时代的原口径。
+ * 但**本网关自己推算**出来的时刻(退避序列外推、策略兜底)没有上游背书,
+ * 不该让一次网络抖动换来整段冷却 —— 那正是用户报的现象。
+ * 两种来源用 {@link CooldownHint.untilSource} 区分,缺省按 `"gateway"`。
  *
  * ⚠️ 瞬时故障**不清零已存在的** `cooldownUntil`:上一次冷却还没到期时,这次抖动
  * 也无权把它缩短(只有成功能解冻)。
@@ -342,13 +369,24 @@ export function noteFailure(
     updatedAt: now,
   };
 
-  if (until !== null && Number.isFinite(until)) {
+  // 1. 上游**明确**给了恢复时刻 —— 压过瞬时豁免(继承自 Python 时代的原口径:
+  //    「上游都明说『到 X 之前别来』了,就没有『这是瞬时抖动』的解释空间」)。
+  //    只认 `untilSource: "upstream"`;网关自己推算的时刻没这个权威(见下)。
+  const untilIsUpstream = opts.hint?.untilSource === "upstream";
+  if (until !== null && Number.isFinite(until) && untilIsUpstream) {
     // 上游指定时刻:直接落,**不跟 now + floor 取 max**。
     next.cooldownUntil = Number(until);
     return next;
   }
+  // 2. 已知瞬时故障:只记账,不熔断。⚠️ 不清零已有的 cooldownUntil。
+  //    走到这里说明 `until`(若有)是网关推算的 —— 没有上游背书,一并丢弃。
+  //    2026-11-23 用户 m03723「瞬时错误不要进冷却」。
   if (TRANSIENT_KINDS.has(kind)) {
-    // 已知瞬时故障:只记账,不熔断。⚠️ 不清零已有的 cooldownUntil。
+    return next;
+  }
+  // 3. 网关推算的 until(退避序列外推 / 策略兜底)。
+  if (until !== null && Number.isFinite(until)) {
+    next.cooldownUntil = Number(until);
     return next;
   }
   // 偶发 5xx 一次性豁免:只在该 provider 的「连续失败第一次」生效。

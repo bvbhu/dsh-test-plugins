@@ -682,6 +682,16 @@ export class Router {
       cachedTokens?: number;
       cooldownUntil?: number | null;
       /**
+       * `cooldownUntil` 的**出处**,决定它压不压得过「瞬时故障不冷却」。
+       *
+       * - `"upstream"`:`cooldownUntil` 来自上游明确给的恢复时刻(`Retry-After`),
+       *   即便 kind 属瞬时故障也照落冷却 —— 上游都说「到 X 之前别来」了。
+       * - `"gateway"`(缺省):本网关自己推算的时刻,瞬时故障的豁免照样压过它。
+       *
+       * 见 `CooldownHint.untilSource`。
+       */
+      cooldownUntilSource?: "upstream" | "gateway";
+      /**
        * 本次尝试**作废**:只释放租约 —— 既不记成功也不记失败、不冷却、不动 pin。
        *
        * 用于「客户端参数与上游不兼容,丢掉参数重试」(2026-10-24 m09081 的
@@ -750,6 +760,9 @@ export class Router {
       ? { until: null, policy: null }
       : {
           until: opts.cooldownUntil ?? null,
+          // 只有上游**明确**给了恢复时刻(`Retry-After`)才有资格压过
+          // 「瞬时故障不冷却」的豁免;没给就是网关推算(缺省)。
+          untilSource: opts.cooldownUntilSource ?? "gateway",
           policy: this.cooldownPolicy(ep.provider),
         };
     // ⚠️ **被抢占 ≠ 上游失败**(m02240):端点一次都没失败过,只是「直连优先级

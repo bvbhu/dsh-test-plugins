@@ -85,7 +85,13 @@ export const MAX_HONORED_RETRY_AFTER_S = 86_400;
  * 上游给了 `retry_after`(clawbrain 的 503 body、OpenAI 的 `Retry-After` 头)
  * 就按它算 —— 这就是「**优先按上游给出的时间**」:上游明说「30 秒后重试」,
  * 就没有理由拿全局 15 分钟熔断去压它。没给 → `undefined`,调用方回落
- * router 的 provider 覆盖 / 全局 floor(见 `CooldownHint` 的三层优先级)。
+ * router 的 provider 覆盖 / 全局 floor(见 `CooldownHint` 的优先级)。
+ *
+ * ⚠️ **瞬时故障也照算**(2026-11-23 用户 m03723 定案为折中口径):这里返回的
+ * 时刻一律标 `untilSource: "upstream"`(见调用点),而 `noteFailure` 的瞬时豁免
+ * 只压得过**网关自己推算**的时刻,压不过上游明确给的 —— 上游都明说「到 X
+ * 之前别来」了,就没有「这是瞬时抖动」的解释空间。所以不能在这里按 kind
+ * 提前返回 `undefined`,否则会把上游的权威值悄悄丢掉。
  */
 export function cooldownUntilOf(gerr: UpstreamError): number | undefined {
   if (gerr.retryAfter === undefined) return undefined;

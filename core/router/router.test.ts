@@ -147,6 +147,8 @@ function failOnce(
     status?: number;
     error?: string;
     cooldownUntil?: number | null;
+    /** `cooldownUntil` 的出处,决定它压不压得过瞬时豁免(缺省 gateway)。 */
+    cooldownUntilSource?: "upstream" | "gateway";
     logicalName?: string;
   } = {},
 ) {
@@ -165,6 +167,7 @@ function failOnce(
     kind: over.kind ?? UpstreamErrorKind.Auth,
     status: over.status ?? 401,
     cooldownUntil: over.cooldownUntil ?? null,
+    cooldownUntilSource: over.cooldownUntilSource,
   });
   return router.health.get(item.endpoint.endpointId);
 }
@@ -806,7 +809,8 @@ describe("瞬时故障不冷却(2026-10-18 定案)", () => {
   });
 
   it("上游给了**明确恢复时刻**时,瞬时故障也照样冷到那一刻", () => {
-    // 优先级:上游显式 until > 「瞬时故障不冷却」。
+    // 优先级:上游显式 until(untilSource="upstream") > 「瞬时故障不冷却」。
+    // 折中口径(2026-11-23 m03723):只有上游明确给的时刻有这权威;网关推算的不算。
     const { router, clock } = makeRouter();
     const ch = chain([{ model: "m0" }]);
     const t0 = clock.wallNow();
@@ -815,8 +819,25 @@ describe("瞬时故障不冷却(2026-10-18 定案)", () => {
       status: 504,
       error: "等待上游超过 25s 无响应",
       cooldownUntil: t0 + 120,
+      cooldownUntilSource: "upstream",
     });
     expect(rec.cooldownUntil - t0).toBeCloseTo(120, 6);
+  });
+
+  it("网关推算的 until 压不过瞬时豁免:timeout 照样不冷却", () => {
+    // 反向边界:同样的 until,来源是 gateway 时不该熔断(2026-11-23 m03723)。
+    const { router, clock } = makeRouter();
+    const ch = chain([{ model: "m0" }]);
+    const t0 = clock.wallNow();
+    const rec = failOnce(router, ch, "s", {
+      kind: UpstreamErrorKind.Timeout,
+      status: 504,
+      error: "等待上游超过 25s 无响应",
+      cooldownUntil: t0 + 120,
+      cooldownUntilSource: "gateway",
+    });
+    expect(rec.cooldownUntil).toBe(0);
+    expect(rec.fails).toBe(1);
   });
 
   it("对照组:upstream(5xx)**照旧**冷却 —— 豁免名单的边界", () => {
