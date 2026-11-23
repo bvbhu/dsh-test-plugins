@@ -12,7 +12,6 @@
 import type { CredentialVault } from "@as-one/core/src/config/credentials.js";
 import { providerDisplayName } from "@as-one/core/src/config/provider-labels.js";
 import { CHECKIN_PROVIDERS, checkinSupported } from "@as-one/core/src/connectors/checkin.js";
-import { isQoderClaimedStatus } from "@as-one/core/src/connectors/qoder-wire.js";
 import { codeartsIdeCheckin } from "@as-one/core/src/connectors/codearts-ide.js";
 import { MINIMAX_QUOTA_TIMEOUT_MS } from "@as-one/core/src/collector/quota.js";
 import { minimaxSigninStatus } from "@as-one/core/src/connectors/minimax-signin.js";
@@ -664,63 +663,6 @@ export function createPanel(ctx: PanelContext, deps: PanelDeps): PanelBundle {
       if (row !== null) channels.push(row);
     }
 
-    // ── qoder:逐账号查 CLAIM_BENEFIT 活动的 claimStatus ──
-    {
-      const row = await cachedChannel("qoder", async () => {
-        const acc = await qd.methods.getQoderAccounts();
-        let checkedIn = 0;
-        let pending = 0;
-        // 逐账号求和(2026-11-07 合并页定案):「今日积分」= 每个账号可领/已领的
-        // 当日额度之和,不是最后一个账号的值 —— 与 minimax 同口径。
-        let dailyCredit = 0;
-        // 每账号今日积分:全部相同才给 perAccountCredit(前端显示「值×账号数」)。
-        const perAccountAmounts: number[] = [];
-        let reason: string | null = null;
-        let error: string | null = null;
-        for (const row of acc.accounts) {
-          if (!row.hasPat) {
-            reason = reason ?? "账号缺 PAT,无法查询签到";
-            continue;
-          }
-          const res = await qd.methods.qoderCampaigns("qoder", row.account);
-          if (res.error) {
-            error = res.error;
-            continue;
-          }
-          const daily = res.campaigns.find((c) => c.actionType === "CLAIM_BENEFIT");
-          if (!daily) {
-            pending += 1;
-            continue;
-          }
-          if (typeof daily.amount === "number") {
-            dailyCredit += daily.amount;
-            perAccountAmounts.push(daily.amount);
-          }
-          if (isQoderClaimedStatus(daily.claimStatus)) checkedIn += 1;
-          else pending += 1;
-        }
-        return {
-          provider: "qoder",
-          label: checkinLabelOf("qoder"),
-          supported: true,
-          accounts: acc.count,
-          countExact: true,
-          checkedIn,
-          pending,
-          dailyCredit,
-          // 多账号且各账号积分完全一致 → 给统一单账号值(前端显示 `100×2`)
-          perAccountCredit:
-            perAccountAmounts.length > 1 && new Set(perAccountAmounts).size === 1
-              ? perAccountAmounts[0]!
-              : null,
-          streak: null,
-          reason,
-          error,
-        };
-      });
-      if (row !== null) channels.push(row);
-    }
-
     return { channels };
   };
 
@@ -943,36 +885,10 @@ export function createPanel(ctx: PanelContext, deps: PanelDeps): PanelBundle {
         }
       }
 
-      // qoder:整池逐个签(qoderCheckin 内部已按账号池循环)
-      try {
-        const views = await qd.methods.qoderCheckin("qoder");
-        const claimed = views.filter((v) => v.status === "claimed").length;
-        const already = views.filter((v) => v.status === "already-claimed").length;
-        const unavailable = views.filter((v) => v.status === "unavailable").length;
-        if (claimed + already > 0) {
-          anyOk = true;
-          // Qoder 也是一个渠道:计入摘要的成功数(与上面循环同口径)。
-        }
-        // ⚠️ 即使有账号签成功，也要**明确列出没有签到活动的账号**
-        // （用户 2026-11：「qoder 请明确返回账号没有签到活动」）——
-        // 否则用户只看到 1/3 却不知道另外两个为什么没签。
-        const noActivity = views.filter((v) => v.status === "unavailable");
-        if (noActivity.length > 0) {
-          // 只列账号名 —— 原因已由外层统一说明，逐账号再重复一遍会嵌套成
-          // 「…没有签到活动（…）：a（该账号当前没有签到活动…）」这种车轱辘话。
-          failedDetails.push(
-            `Qoder：${noActivity.length} 个账号当前没有签到活动（上游未下发，非设备限制，也非插件故障）：${noActivity
-              .map((v) => v.account)
-              .join("、")}`,
-          );
-        }
-        parts.push(
-          `Qoder:签到 ${claimed} / 已签 ${already}${unavailable ? ` / 不可用 ${unavailable}` : ""}`,
-        );
-      } catch (e) {
-        failedDetails.push(`Qoder：${errTextOf(e)}`);
-        parts.push(`Qoder:${errTextOf(e)}`);
-      }
+      // ⚠️ 2026-11-24 用户定案:**不再自动签 qoder**。
+      // 上游已取消免费用户的每日签到活动(见 docs/ban-watch.md 2026-11-21/11-24)，
+      // 每天跑一次只会一直报「没有签到活动」，徒增噪音。手动入口(qoderCheckin
+      // RPC / 渠道页)保留，不再由「全部签到」触发。
 
       // ⚠️ 真签到动作后必须打掉日缓存(2026-11-07 缓存引入):否则下面重读
       // 拿到的还是「签之前」的缓存,「签完还显示未签」就回来了。
