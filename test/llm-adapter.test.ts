@@ -17,6 +17,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { UpstreamError } from "@as-one/core/src/gateway/types.js";
+import { allBusyError } from "@as-one/core/src/gateway/server.js";
 import type {
   ChatCompletionChunk,
   ChatMessage,
@@ -30,6 +31,7 @@ import {
   AS_ONE_PROVIDER,
   AsOneLlmAdapter,
   AsOneLlmError,
+  CAPACITY_CODE,
   finishKindOf,
   modelInfoOf,
   resolveImagesInMessages,
@@ -868,6 +870,44 @@ describe("toLlmError", () => {
     expect(toLlmError(new Error("boom"), "f").code).toBe("SERVER");
     expect(toLlmError("not an error", "兜底").message).toBe("兜底");
   });
+
+  // ── 并发已满(all_busy)：必须是**默认不重试**的码 ─────────────────────────────
+  /**
+   * 宿主**默认**重试码 —— 逐字抄自 `dsh-llm` 的 `DEFAULT_RETRYABLE_CODES`
+   * (v0.2.2-rc.5 `packages/llm/llm/src/retry-policy.ts:19`)。
+   * `dsh-llm-retry` 的判据只有一句 `policy.retryableCodes.includes(failure.code)`
+   * (同版本 `packages/llm/llm-retry/src/index.ts:212`),所以这份名单就是
+   * 「会不会被宿主自动重试」的**唯一**依据。宿主包是 peer(测试环境装不到),
+   * 只能抄一份当夹具;宿主升级改了默认名单要同步这里。
+   */
+  const HOST_DEFAULT_RETRYABLE_CODES: readonly string[] = [
+    "EMPTY_RESPONSE",
+    "RATE_LIMIT",
+    "SERVER",
+    "TIMEOUT",
+    "TRANSPORT",
+  ];
+  const hostAutoRetries = (code: string): boolean => HOST_DEFAULT_RETRYABLE_CODES.includes(code);
+
+  it("并发已满(网关 503 capacity)→ CAPACITY:中文 message 保留,宿主不会自动重试", () => {
+    const out = toLlmError(allBusyError(), "fallback");
+    expect(out.code).toBe(CAPACITY_CODE);
+    // 宿主 normalizeLlmFailure 只在「own failure 且 failure.code === own code」时复用,
+    // 否则整份 failure 作废成 UNKNOWN —— 所以两者必须同值。
+    expect(out.failure.code).toBe(out.code);
+    expect(out.message).toContain("并发已满");
+    expect(out.failure.status).toBe(503);
+    // 关键断言:默认策略不会重试它(重试只会继续撞满并发)。
+    expect(hostAutoRetries(out.code)).toBe(false);
+    // 旧行为是落到兜底的 SERVER —— 那正是「已重试模型请求 (5/5) · 8s」的根因。
+    expect(hostAutoRetries("SERVER")).toBe(true);
+  });
+
+  it("上游 5xx 仍走 SERVER(默认重试):修并发满不能顺手掐掉上游重试", () => {
+    const err = new UpstreamError("upstream", "上游暂时不可用", { statusCode: 502 });
+    expect(toLlmError(err, "f").code).toBe("SERVER");
+    expect(hostAutoRetries("SERVER")).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1068,6 +1108,40 @@ describe("AsOneLlmAdapter", () => {
       })(),
     ).rejects.toMatchObject({ code: "RATE_LIMIT" });
     expect(captured.done).toMatchObject({ ok: false, status: 429, error_kind: "rate_limit" });
+  });
+
+  it("选路全忙(网关 allBusyError)→ CAPACITY:宿主不会再自动重试,明细仍记 503", async () => {
+    const captured: Captured = {};
+    const rt = {
+      listModels: async () => [entry({ id: "auto" })],
+      resolveModelEntry: (id: string) => (id === "auto" ? entry({ id: "auto" }) : undefined),
+      resolveUpstream: () =>
+        ({
+          stream() {
+            return (async function* (): AsyncGenerator<ChatCompletionChunk> {
+              // 与真实链路同形:gateway-upstream 的 planErrorOf 对 all_busy 抛的就是它。
+              throw allBusyError();
+            })();
+          },
+          complete: async () => {
+            throw new Error("no");
+          },
+        }) as unknown as Upstream,
+      onRequestDone: (info: RequestDoneInfo) => {
+        captured.done = info;
+      },
+    } as unknown as AsOneRuntime;
+    const adapter = new AsOneLlmAdapter(rt);
+    await expect(
+      (async () => {
+        for await (const _c of adapter.stream(emptyOptions)) {
+          /* drain */
+        }
+      })(),
+    ).rejects.toMatchObject({ code: CAPACITY_CODE, failure: { status: 503 } });
+    // 明细照记:面板「实时日志」里仍是一条 503 的本地上游失败。
+    expect(captured.done).toMatchObject({ ok: false, status: 503 });
+    expect(captured.done?.error).toContain("并发已满");
   });
 
   it("未知模型:stream 抛 INVALID_REQUEST/404,不静默产空流", async () => {

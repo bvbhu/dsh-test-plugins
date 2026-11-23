@@ -34,6 +34,7 @@ import type {
   UpstreamRequest,
 } from "@as-one/core/src/gateway/types.js";
 import { UpstreamError } from "@as-one/core/src/gateway/types.js";
+import { BUSY_DETAIL, GatewayHttpError } from "@as-one/core/src/gateway/server.js";
 import type { BlockMessage, BlockRequest, WireBlock } from "@as-one/core/src/wire/anthropic.js";
 import type { AsOneRuntime } from "./setup.js";
 import { buildMergePrompt, cleanDigest, joinDigests, needsMerge, planCompactChunks } from "./compact-chunk.js";
@@ -121,9 +122,58 @@ const KIND_TO_CODE: Record<string, string> = {
   already_streaming: "INVALID_REQUEST",
 };
 
+/**
+ * 「本网关并发已满」的宿主错误码(`all_busy`,**不是**上游 5xx)。
+ *
+ * 为什么必须单列一个码:网关的 all_busy 出口是 `503 + {"type":"capacity"}`
+ * (见 `core/gateway/server.ts` 的 `allBusyError()`),它**不是** `UpstreamError`,
+ * 以前落到 {@link toLlmError} 的兜底 `SERVER` 上。而宿主 `dsh-llm-retry` 的判据
+ * 只有一句 `policy.retryableCodes.includes(failure.code)`
+ * (`packages/llm/llm-retry/src/index.ts`),默认名单恰好含 `SERVER`
+ * (`DEFAULT_RETRYABLE_CODES = EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT /
+ * TRANSPORT`,`packages/llm/llm/src/retry-policy.ts`) ⇒ 一次本地并发打满会被
+ * 宿主**自动重试 5 次**,每次都继续撞满并发;界面表现为「已重试模型请求 (5/5) ·
+ * 8s」「重试延迟 7307 毫秒」(500ms 起指数退避 + 10% 抖动)。
+ *
+ * 语义:并发满是**本地调度器的瞬时状态**,稍后再试确实有用,但「何时再试」该由
+ * 用户/客户端决定,不该让宿主立刻连打五发。所以给一个**默认不重试**的自有码
+ * (不是宿主内置码,不在任何默认名单里;用户在设置里明确勾选它才会自动重试)。
+ * 码名与网关错误体的 `type: "capacity"` 对齐,面板/日志里能直接对上。
+ */
+export const CAPACITY_CODE = "CAPACITY";
+
+/**
+ * 网关自造的「并发已满」错误体判据。
+ *
+ * 形状固定为 `{"detail":{"error":{"type":"capacity","message":…}}}`;有上游原件时
+ * 走的是逐字透传(`upstreamErrorToHttp`),**不存在**这个形状,所以命中即「本地
+ * 容量」而不是上游答复。message 用错误体里的中文原文(即 {@link BUSY_DETAIL}),
+ * 客户端读得懂,也知道稍后重试有用。
+ */
+function capacityFailureOf(err: GatewayHttpError): { message: string; status: number } | undefined {
+  const detail = err.body?.detail;
+  if (typeof detail !== "object" || detail === null) return undefined;
+  const inner = (detail as { error?: unknown }).error;
+  if (typeof inner !== "object" || inner === null) return undefined;
+  if ((inner as { type?: unknown }).type !== "capacity") return undefined;
+  const message = (inner as { message?: unknown }).message;
+  return {
+    message: typeof message === "string" && message.length > 0 ? message : BUSY_DETAIL,
+    status: err.status,
+  };
+}
+
 /** 把 As One 侧的任意异常翻译成宿主认得的失败。 */
 export function toLlmError(err: unknown, fallbackMessage: string): AsOneLlmError {
   if (err instanceof AsOneLlmError) return err;
+  // ⚠️ 网关自造错误不是 UpstreamError:并发已满必须落到非重试的 `CAPACITY`,
+  // 否则兜底成 `SERVER` 会让宿主自动重试(见 CAPACITY_CODE 的说明)。
+  if (err instanceof GatewayHttpError) {
+    const capacity = capacityFailureOf(err);
+    if (capacity !== undefined) {
+      return new AsOneLlmError(capacity.message, CAPACITY_CODE, { status: capacity.status });
+    }
+  }
   if (err instanceof UpstreamError) {
     const code = KIND_TO_CODE[err.kind] ?? "SERVER";
     const status = typeof err.statusCode === "number" ? err.statusCode : undefined;
