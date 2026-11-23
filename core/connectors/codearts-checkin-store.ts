@@ -38,6 +38,23 @@ export interface CodeartsCheckinRecord {
 
 const DAY_MS = 86_400_000;
 
+/**
+ * 上游 expireAt（秒 10 位 / 毫秒 13 位）→ 毫秒，并保证是**晚于签到时刻**的未来时刻。
+ *
+ * 2026-11-23 实测：上游 claim 响应偶尔会把「上一批即将作废积分的到期点」填进
+ * `expireAt`，得到一个早于 `claimedAtMs` 的过去时刻。签到积分是「签到后 24h 有效」，
+ * 作废时刻不可能早于领取时刻，所以这里一律判废、回退成 `claimedAtMs + DAY_MS`。
+ * 写（mark）和读（read，兜底老脏数据）共用同一口径。
+ */
+function expireMsOf(rawExpire: unknown, claimedAtMs: number): number {
+  const n = typeof rawExpire === "number" ? rawExpire : Number(rawExpire);
+  if (Number.isFinite(n) && n > 0) {
+    const ms = n < 1e11 ? Math.round(n * 1000) : Math.round(n);
+    if (ms > claimedAtMs) return ms;
+  }
+  return claimedAtMs + DAY_MS;
+}
+
 /** 安全解析 raw_json（坏 JSON → 空对象，与 credentials.ts:parseRaw 同口径）。 */
 function parseRaw(rawJson: string | null | undefined): Record<string, unknown> {
   if (rawJson === null || rawJson === undefined || rawJson.trim() === "") return {};
@@ -63,8 +80,8 @@ export function readCodeartsCheckin(
   const expire = Number(v["expire_at_ms"]);
   const credit = Number(v["credit"]);
   if (!Number.isFinite(claimed) || claimed <= 0) return null;
-  // expire 缺失时按 claimed+24h 兜底（老记录可能没有 expire 字段）。
-  const expireMs = Number.isFinite(expire) && expire > 0 ? expire : claimed + DAY_MS;
+  // expire 缺失或是早于签到的过去时刻（老脏数据）→ 按 claimed+24h 兜底。
+  const expireMs = expireMsOf(v["expire_at_ms"], claimed);
   return {
     claimed_at_ms: claimed,
     expire_at_ms: expireMs,
@@ -95,14 +112,8 @@ export function markCodeartsCheckin(
   if (row === null || row === undefined) throw new Error(`codearts 凭据不存在: ${username}`);
   const raw = parseRaw(row.raw_json);
   const claimedAtMs = input.claimedAtMs ?? Date.now();
-  // 上游 expireAt 可能是秒(10 位)或毫秒(13 位)，与 quota.ts 同阈值判断。
-  const rawExpire = input.expireAtMs ?? null;
-  const expireAtMs =
-    rawExpire !== null && Number.isFinite(rawExpire) && rawExpire > 0
-      ? rawExpire < 1e11
-        ? Math.round(rawExpire * 1000)
-        : Math.round(rawExpire)
-      : claimedAtMs + DAY_MS;
+  // 上游 expireAt 可能是秒(10 位)或毫秒(13 位)；早于签到的过去时刻一律判废回退 24h。
+  const expireAtMs = expireMsOf(input.expireAtMs ?? null, claimedAtMs);
   const rec: CodeartsCheckinRecord = {
     claimed_at_ms: claimedAtMs,
     expire_at_ms: expireAtMs,
