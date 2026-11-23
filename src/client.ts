@@ -15,6 +15,7 @@ import type { Context } from "./client/context.js";
 import { LOCALE_NS, en, zh } from "./client/locales.js";
 import { AsOnePanelIcon, AsOnePanelPage } from "./client/panel.js";
 import { AsOneCurrentModelBadge } from "./client/routeBadge.js";
+import { SubagentModelSelect } from "./client/subagent-model-select.js";
 
 // 共享面板样式内联注入(幂等)+ 数据桥接到 HTTP 路由,使 lib/client.js 自包含。
 injectAsOneStyles();
@@ -73,6 +74,25 @@ export function apply(ctx: Context, _config: Record<string, unknown> = {}): void
           locale: LOCALE_NS,
         },
         AsOneCurrentModelBadge,
+      ),
+    ),
+  );
+  // continuation 子代理会话的模型选择器:原生选择器对子代理会话硬禁用,
+  // 这里自建一个视觉/交互一模一样的控件。组件内部用 useProjection('subagent')
+  // 判断 mode==='continuable' 才渲染,one-shot / unknown / 普通会话一律返回 null。
+  // 位置放在输入框**右下角**的 `conversation.input.right`(提交按钮前的紧凑控件,
+  // list 型、会话作用域)—— 与 DSH 原生模型选择器的位置一致,而原生那个 seat 是
+  // single 且被硬禁用,subagent 会话里是空的,这里补一个自建的。
+  ctx.effect(() =>
+    ctx.slots.inject("conversation.input.right", () =>
+      ctx.slots.register(
+        {
+          name: "conversation.input.right",
+          id: "as-one-subagent-model",
+          order: 6,
+          locale: LOCALE_NS,
+        },
+        SubagentModelSelect,
       ),
     ),
   );

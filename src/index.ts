@@ -25,6 +25,7 @@ import { warmupDeepseekTokenizer } from "@as-one/core/src/tokenizer/deepseek.js"
 import { setupAsOne, type AsOneRuntime } from "./setup.js";
 import { buildGatewayRoutes } from "./routes.js";
 import { buildPanelRoutes } from "./panel-routes.js";
+import { buildSubagentModelRoutes, subagentModelDepsOf } from "./subagent-model-api.js";
 import { AS_ONE_PROVIDER, AsOneLlmAdapter } from "./llm-adapter.js";
 import type { DshAttachmentService } from "./llm-types.js";
 import type { Context } from "./context-types.js";
@@ -190,12 +191,15 @@ async function startAsOne(ctx: Context): Promise<void> {
     () => {
       // 面板要先建出来 —— 预热门要借它的 `syncAllQuota(true)` 打真实探针。
       const panelRoutes = buildPanelRoutes(runtime);
+      // 子代理会话模型选择器:continuable 子代理页原生选择器被硬禁用,
+      // 这里挂三条中转路由(模型目录/会话信息/切换),复用宿主 sessionController。
+      const subagentModelRoutes = buildSubagentModelRoutes(subagentModelDepsOf(ctx));
       const gatewayRoutes = buildGatewayRoutes(runtime, {
         logger: ctx.logger as unknown as Pick<Console, "warn" | "error">,
         warmup,
       });
       const disposers: (() => void)[] = [];
-      for (const route of [...gatewayRoutes, ...panelRoutes]) {
+      for (const route of [...gatewayRoutes, ...panelRoutes, ...subagentModelRoutes]) {
         try {
           // 宿主 register 收单条路由对象;返回 disposer。
           disposers.push(ctx.webServer.register(route as never));
@@ -204,7 +208,7 @@ async function startAsOne(ctx: Context): Promise<void> {
         }
       }
       ctx.logger?.info?.(
-        `[as-one] mounted ${gatewayRoutes.length} gateway route(s) + ${panelRoutes.length} panel route(s)`,
+        `[as-one] mounted ${gatewayRoutes.length} gateway route(s) + ${panelRoutes.length} panel route(s) + ${subagentModelRoutes.length} subagent-model route(s)`,
       );
       // 预热 DeepSeek 分词表(纯内存建表 ~100ms)。放在挂载时而不是第一次请求时:
       // 那一百毫秒恰好落在「用户按下回车」上就很明显。
