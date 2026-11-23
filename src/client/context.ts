@@ -40,7 +40,7 @@ export interface AsOneMainEntrySpec {
  * 顶掉它 —— 两条路都会让另一方的徽标消失。list 槽位各占一格,不打架。
  */
 export interface AsOneInputEntrySpec {
-  name: "conversation.input.left";
+  name: "conversation.input.left" | "conversation.input.right";
   id: string;
   order: number;
   locale?: string;
@@ -55,7 +55,7 @@ export type AsOneSlotEntrySpec =
   | AsOneMainEntrySpec
   | AsOneInputEntrySpec;
 
-export type AsOneSlotName = "sidebar.panellist" | "main" | "conversation.input.left";
+export type AsOneSlotName = "sidebar.panellist" | "main" | "conversation.input.left" | "conversation.input.right";
 
 export interface AsOneSlotsService {
   /** 声明一个槽位注入:槽位宿主回调时注册条目,返回的 dispose 由宿主负责。 */

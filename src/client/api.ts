@@ -82,3 +82,81 @@ export function fetchSessionCurrentRoute(
 ): Promise<SessionCurrentRoute | null> {
   return post<SessionCurrentRoute | null>("getSessionCurrentRoute", [sessionId, model]);
 }
+
+// ── 子代理会话模型选择器(client ↔ host 中转路由) ────────────────────────
+
+export interface SubagentModelSelection {
+  provider: string;
+  model: string;
+  reasoningEffort?: string;
+}
+
+export interface SubagentModelReasoningEffort {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+export interface SubagentModelReasoning {
+  efforts: SubagentModelReasoningEffort[];
+  defaultEffort?: string;
+}
+
+export interface SubagentModelBadge {
+  text: string | Record<string, string>;
+  tone: "neutral" | "info" | "success" | "warning";
+}
+
+export interface SubagentModelCatalogEntry {
+  id: string;
+  name: string;
+  description?: string;
+  reasoning?: SubagentModelReasoning;
+  badge?: SubagentModelBadge;
+}
+
+export interface SubagentModelCatalogGroup {
+  id: string;
+  name: string;
+  models: SubagentModelCatalogEntry[];
+}
+
+export interface SubagentModelCatalogFailure {
+  id: string;
+  name: string;
+  message: string;
+}
+
+export interface SubagentModelCatalog {
+  default: SubagentModelSelection;
+  routableProviders: string[];
+  groups: SubagentModelCatalogGroup[];
+  failures: SubagentModelCatalogFailure[];
+}
+
+export interface SubagentSessionInfo {
+  sessionId: string;
+  isSubagent: boolean;
+  mode: "one-shot" | "continuable" | "unknown" | null;
+  parentSessionId: string | null;
+}
+
+/** DSH 原生模型目录(经 host sessionController.modelCatalog 中转)。 */
+export function fetchModelCatalog(): Promise<SubagentModelCatalog> {
+  return post<SubagentModelCatalog>("getModelCatalog", []);
+}
+
+/** 会话子代理身份兜底(client 投影拿不到时用)。 */
+export function fetchSubagentSessionInfo(sessionId: string): Promise<SubagentSessionInfo> {
+  return post<SubagentSessionInfo>("getSubagentSessionInfo", [sessionId]);
+}
+
+/** 切换会话模型(经 host sessionController.selectModel → agent.model.select)。 */
+export function selectSubagentModel(
+  sessionId: string,
+  provider: string,
+  model: string,
+  reasoningEffort?: string,
+): Promise<unknown> {
+  return post<unknown>("selectModel", [sessionId, provider, model, reasoningEffort]);
+}
