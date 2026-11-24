@@ -124,6 +124,11 @@ export interface SubagentSessionInfo {
   readonly isSubagent: boolean;
   readonly mode: "one-shot" | "continuable" | "unknown" | null;
   readonly parentSessionId: string | null;
+  /**
+   * 该会话此刻是否有可写 live Session。`false` ⇒ 模型切换必然不可用
+   * (子代理休眠),UI 应把选择器置灰并说明原因,而不是让用户点出 500。
+   */
+  readonly isLive: boolean;
 }
 
 interface SubagentAddress {
@@ -196,7 +201,42 @@ export interface SubagentModelDeps {
   modelCatalog(): Promise<ModelCatalog>;
   selectModel(request: SelectModelRequest): Promise<SelectModelValue>;
   subagentAddress(sessionId: string): SubagentAddress | undefined;
+  /**
+   * 该会话此刻是否真的有**可写**的 live Session。
+   *
+   * 子代理会话只在它的 Agent 运行期间存在于 `agent/created` 缓存里;休眠时
+   * 任何人都拿不到可写 Session(宿主对子代理生命周期独占)。UI 据此决定
+   * 选择器可用与否,避免让用户点出一个必然失败的 500。
+   */
+  isSessionLive(sessionId: string): boolean;
   logger?: { warn?(message: string, error?: unknown): void };
+}
+
+/**
+ * 目标子代理会话当前**没有活的 Session**(agent 未在运行),因此没有可写入的日志。
+ *
+ * 为什么必须单独一类:宿主对子代理会话的生命周期是独占的 ——
+ * `sessionController.resolveAgent(childId)` 直接返回
+ * `RemoteError("session/agent-busy", 'session "…" is owned by subagent routing',
+ * { reason: "use subagent delivery for this child session" })`,
+ * `sessions.get(childId)` 也是 undefined(child scope 隔离)。
+ * 唯一能拿到可写 Session 的时机是 `agent/created` 事件里 —— 也就是说
+ * **子代理必须正在运行**。用户单纯翻看一个已结束的子代理会话时,任何人都无法
+ * 写它的模型选择(DSH 自己的选择器干脆对这类会话 `available:false`)。
+ *
+ * 这不是「内部错误」,而是**状态不满足**;路由层据此返回 409 而不是 500。
+ */
+export class SubagentSessionNotLiveError extends Error {
+  readonly sessionId: string;
+
+  constructor(sessionId: string) {
+    super(
+      `子代理会话 ${sessionId} 当前未在运行,模型只能在其运行时切换。` +
+        `请在该子代理执行期间操作,或先发一条消息让它启动。`,
+    );
+    this.name = "SubagentSessionNotLiveError";
+    this.sessionId = sessionId;
+  }
 }
 
 const EMPTY_CATALOG: ModelCatalog = {
@@ -250,6 +290,11 @@ export function subagentModelDepsOf(ctx: Context): SubagentModelDeps {
   });
 
   return {
+    isSessionLive: (sessionId) => {
+      if (sessionCache.has(sessionId)) return true;
+      const live = sessionsOf()?.get?.(sessionId) as { append?: unknown } | undefined;
+      return typeof live?.append === "function";
+    },
     modelCatalog: async () => {
       const controller = controllerOf();
       if (controller === undefined) {
@@ -266,7 +311,7 @@ export function subagentModelDepsOf(ctx: Context): SubagentModelDeps {
       const session: ({ readonly header?: SessionHeaderLike } & Partial<WritableSessionLike>) | undefined =
         cached ?? sessions?.get?.(request.sessionId);
       if (session === undefined || typeof session.append !== "function") {
-        throw new Error(`session ${request.sessionId} 没有 live Session(模型切换不可用)`);
+        throw new SubagentSessionNotLiveError(request.sessionId);
       }
       // 在闭包外收窄成局部常量,供 async 回调内使用。
       const sessionsForFlush = sessions;
@@ -365,6 +410,13 @@ export function buildSubagentModelRoutes(deps: SubagentModelDeps): AsOneWebRoute
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         deps.logger?.warn?.(`[as-one] ${method} failed:`, err);
+        // 「子代理没在运行」是**状态不满足**,不是内部错误:返回 409 +
+        // 稳定错误码,UI 能据此把选择器置灰并给出可操作的说明,而不是
+        // 让用户对着一个 500 猜(用户 m03723 报的就是这个 500)。
+        if (err instanceof SubagentSessionNotLiveError) {
+          writeJson(res, 409, fail("subagent_session_not_live", detail));
+          return;
+        }
         writeJson(res, 500, fail("internal_error", detail));
       }
     },
@@ -391,6 +443,7 @@ export function buildSubagentModelRoutes(deps: SubagentModelDeps): AsOneWebRoute
         isSubagent: address !== undefined,
         mode,
         parentSessionId: address?.parentSessionId ?? null,
+        isLive: sessionId ? deps.isSessionLive(sessionId) : false,
       };
       return info;
     }),
