@@ -35,6 +35,15 @@
  * `model/selection` 事件后,`modelSelection` 投影(`core/agent/src/model-selection.ts:72-90`)
  * 折叠出 `next=selection`,client 选择器与下一个模型请求立即读到。
  *
+ * 休眠子代理(2026-11-24 用户定案 C):没有 live Session,但可经
+ * `ctx.get('subagents').prompt({childSessionId, delivery:'queue', content, requestId})`
+ * 冷恢复。唤醒消息本身就是模型切换提示(照抄宿主 `modelSwitchNotice` 文案);
+ * 在 `agent/created` 里按 `source.rpcId===requestId` 认出这条消息,注册
+ * `agent.ctx.on('agent/pre-step', …)` 拦截该 turn,写 `model/selection` 后返回
+ * `{kind:'reject'}`(DSH `dsh-agent-loop` 在 LLM 之前短路,且 inbox.claim 已消费消息)。
+ * 因此不会真的执行任务、不发 LLM 请求。宿主对一次性不可恢复子代理抛
+ * `subagent/not-resumable`,这里如实传播,绝不谎称成功。
+ *
  * 形状全部是**结构镜像**(零 `@deepseek-ai` import),避免把宿主类型拖进 bundle。
  */
 
@@ -98,6 +107,8 @@ export interface SelectModelRequest extends ModelSelection {
 
 export interface SelectModelValue {
   readonly selected: ModelSelection;
+  /** `true` 表示这次切换是通过唤醒休眠子代理完成的(投递了模型切换提示消息)。 */
+  readonly activated?: boolean;
 }
 
 interface SessionControllerLike {
@@ -118,16 +129,26 @@ interface AgentDefaultModelLike {
   saveSelection(selection: ModelSelection): Promise<unknown>;
 }
 
+/** `ctx.get('subagents').prompt()` 的结构镜像(只用到这些字段)。 */
+interface SubagentsPromptLike {
+  prompt(
+    request: {
+      childSessionId: string;
+      delivery: "queue" | "steer";
+      requestId: string;
+      content: readonly { readonly type: "text"; readonly text: string }[];
+    },
+    signal?: unknown,
+  ): Promise<unknown>;
+}
+
 /** 子代理会话信息(client 可用它补投影拿不到的字段,如父会话 id)。 */
 export interface SubagentSessionInfo {
   readonly sessionId: string;
   readonly isSubagent: boolean;
   readonly mode: "one-shot" | "continuable" | "unknown" | null;
   readonly parentSessionId: string | null;
-  /**
-   * 该会话此刻是否有可写 live Session。`false` ⇒ 模型切换必然不可用
-   * (子代理休眠),UI 应把选择器置灰并说明原因,而不是让用户点出 500。
-   */
+  /** 该会话此刻是否有可写 live Session。`false` ⇒ 切换需先唤醒休眠子代理。 */
   readonly isLive: boolean;
 }
 
@@ -170,10 +191,37 @@ interface LiveSessionLike extends WritableSessionLike {
  * Cordis 事件源的最小镜像。`agent/created`/`agent/disposed` 的载荷是
  * `{ agent }`,`agent.session` 就是 child scope 里那个可写 Session。
  */
+interface AgentPreStepPayloadLike {
+  readonly messages?: readonly {
+    readonly source?: { readonly rpcId?: unknown };
+  }[];
+}
+
+type AgentPreStepDecision =
+  | { readonly kind: "reject" }
+  | { readonly kind: string; readonly messages?: readonly unknown[] };
+
+interface AgentEventPayloadLike {
+  agent?: {
+    id?: string;
+    session?: LiveSessionLike;
+    ctx?: {
+      on(
+        name: "agent/pre-step",
+        listener: (
+          payload: AgentPreStepPayloadLike,
+          next: () => Promise<AgentPreStepDecision>,
+        ) => Promise<AgentPreStepDecision>,
+        options?: { prepend?: boolean },
+      ): (() => void) | void;
+    };
+  };
+}
+
 interface EventSourceLike {
   on?(
     name: string,
-    listener: (payload: { agent?: { id?: string; session?: LiveSessionLike } }) => void,
+    listener: (payload: AgentEventPayloadLike) => void,
   ): (() => void) | void;
 }
 
@@ -205,34 +253,30 @@ export interface SubagentModelDeps {
    * 该会话此刻是否真的有**可写**的 live Session。
    *
    * 子代理会话只在它的 Agent 运行期间存在于 `agent/created` 缓存里;休眠时
-   * 任何人都拿不到可写 Session(宿主对子代理生命周期独占)。UI 据此决定
-   * 选择器可用与否,避免让用户点出一个必然失败的 500。
+   * 任何人都拿不到可写 Session(宿主对子代理生命周期独占)。UI 据此提示
+   * 「将唤醒并仅切换模型」,但切换本身由 selectModel 走 subagents.prompt 完成。
    */
   isSessionLive(sessionId: string): boolean;
   logger?: { warn?(message: string, error?: unknown): void };
 }
 
 /**
- * 目标子代理会话当前**没有活的 Session**(agent 未在运行),因此没有可写入的日志。
+ * 目标子代理会话当前无法切换模型:既没有可写 live Session,也无法经
+ * `subagents.prompt` 唤醒(宿主未提供该服务,或子代理不可恢复)。
  *
- * 为什么必须单独一类:宿主对子代理会话的生命周期是独占的 ——
- * `sessionController.resolveAgent(childId)` 直接返回
- * `RemoteError("session/agent-busy", 'session "…" is owned by subagent routing',
- * { reason: "use subagent delivery for this child session" })`,
- * `sessions.get(childId)` 也是 undefined(child scope 隔离)。
- * 唯一能拿到可写 Session 的时机是 `agent/created` 事件里 —— 也就是说
- * **子代理必须正在运行**。用户单纯翻看一个已结束的子代理会话时,任何人都无法
- * 写它的模型选择(DSH 自己的选择器干脆对这类会话 `available:false`)。
- *
- * 这不是「内部错误」,而是**状态不满足**;路由层据此返回 409 而不是 500。
+ * 宿主对子代理会话的生命周期是独占的 —— `sessionController.resolveAgent(childId)`
+ * 返回 `RemoteError("session/agent-busy", 'session "…" is owned by subagent routing',
+ * { reason: "use subagent delivery for this child session" })`,`sessions.get(childId)`
+ * 也是 undefined(child scope 隔离)。正常休眠场景现在走 C 方案唤醒唤醒拦截;
+ * 这个错误只保留给「连唤醒都做不到」的降级路径,路由层返回 409 而不是 500。
  */
 export class SubagentSessionNotLiveError extends Error {
   readonly sessionId: string;
 
-  constructor(sessionId: string) {
+  constructor(sessionId: string, reason?: string) {
     super(
-      `子代理会话 ${sessionId} 当前未在运行,模型只能在其运行时切换。` +
-        `请在该子代理执行期间操作,或先发一条消息让它启动。`,
+      `子代理会话 ${sessionId} 当前未在运行,且无法唤醒以切换模型。` +
+        (reason === undefined ? "" : `原因:${reason}`),
     );
     this.name = "SubagentSessionNotLiveError";
     this.sessionId = sessionId;
@@ -269,6 +313,19 @@ export function subagentModelDepsOf(ctx: Context): SubagentModelDeps {
   const sessionsOf = () => serviceOf<SessionsLike>("sessions");
   const llmOf = () => serviceOf<LlmLike>("llm");
   const defaultsOf = () => serviceOf<AgentDefaultModelLike>("agentDefaultModel");
+  const subagentsOf = () => serviceOf<SubagentsPromptLike>("subagents");
+
+  /** 唤醒式切换的一次性标记:`source.rpcId` → 待写选择,先于 prompt 注册。 */
+  const wakePending = new Map<string, { readonly selection: ModelSelection }>();
+  let wakeSeq = 0;
+  const newWakeId = (): string => `as-one-model-switch-${Date.now()}-${++wakeSeq}`;
+
+  /**
+   * 照抄 DSH `modelSwitchNotice`(dsh-agent/lib/index.js:208-221)的提示格式,
+   * 让这条唤醒消息本身就是用户想看到的模型切换提示。
+   */
+  const switchNoticeText = (to: ModelSelection): string =>
+    `[model changed: assistant turns above this point were generated by auto; the session continues with ${to.provider}/${to.model}]`;
 
   // 子代理 Agent/Session 都注册在 child scope,root 的 `agents`/`sessions` store
   // 按 scope 隔离,实测 `ctx.get('sessions').get(childId)` 返回 undefined。
@@ -283,6 +340,37 @@ export function subagentModelDepsOf(ctx: Context): SubagentModelDeps {
     if (session === undefined) return;
     const id = agent?.id ?? session.id;
     if (id !== undefined) sessionCache.set(id, session);
+
+    // 唤醒式切换:冷恢复的 agent 还没跑第一个 step,这里注册拦截。
+    const agentCtx = agent?.ctx;
+    if (agentCtx === undefined || id === undefined) return;
+    for (const [requestId, pending] of wakePending) {
+      const selection = pending.selection;
+      const liveSession = session;
+      const appendSelection = session.append;
+      const sessionsForFlush = sessionsOf();
+      agentCtx.on("agent/pre-step", async (payload, next) => {
+        const claimed = payload.messages ?? [];
+        const isWakeTurn = claimed.some((message) => message?.source?.rpcId === requestId);
+        if (!isWakeTurn) return next();
+        // 本 turn 就是我们的模型切换提示。写 durable 事件 + 立即取消请求,
+        // 不调用 LLM。wakePending 已在注册时删除,故只会触发一次。
+        appendSelection.call(liveSession, "model/selection", selection);
+        if (typeof sessionsForFlush?.flush === "function") {
+          void sessionsForFlush.flush(liveSession).catch((error: unknown) => {
+            logger?.warn?.("[as-one] flush session after wake model switch failed:", error);
+          });
+        }
+        const defaults = defaultsOf();
+        if (defaults !== undefined) {
+          void defaults.saveSelection(selection).catch((error: unknown) => {
+            logger?.warn?.("[as-one] save default model after wake switch failed:", error);
+          });
+        }
+        return { kind: "reject" };
+      }, { prepend: true });
+      wakePending.delete(requestId);
+    }
   });
   events.on?.("agent/disposed", ({ agent }) => {
     const id = agent?.id;
@@ -303,20 +391,6 @@ export function subagentModelDepsOf(ctx: Context): SubagentModelDeps {
       return controller.modelCatalog();
     },
     selectModel: async (request) => {
-      // 优先从 agent/created 缓存取 child Session(child scope 的 live Session
-      // 不在 root sessions store);取不到再回退 root sessions.get()(兼容测试/
-      // 未来宿主把 child 暴露出来的情况)。
-      const sessions = sessionsOf();
-      const cached = sessionCache.get(request.sessionId);
-      const session: ({ readonly header?: SessionHeaderLike } & Partial<WritableSessionLike>) | undefined =
-        cached ?? sessions?.get?.(request.sessionId);
-      if (session === undefined || typeof session.append !== "function") {
-        throw new SubagentSessionNotLiveError(request.sessionId);
-      }
-      // 在闭包外收窄成局部常量,供 async 回调内使用。
-      const sessionsForFlush = sessions;
-      const liveSession = session;
-      const appendSelection = session.append;
       const llm = llmOf();
       if (llm === undefined) {
         throw new Error("宿主未提供 llm 服务(模型校验不可用)");
@@ -328,6 +402,7 @@ export function subagentModelDepsOf(ctx: Context): SubagentModelDeps {
           model: request.model,
           ...(request.reasoningEffort === undefined ? {} : { reasoningEffort: request.reasoningEffort }),
         };
+        // 校验必须在唤醒之前:错误的 provider/model 不该惊动休眠子代理。
         // 复刻 requireModel → modelAvailable(catalog.ts:81-91)。
         if (!llm.listProviders().some((provider) => provider.id === selected.provider)) {
           throw new Error(`Select an available model before sending a message. (provider=${selected.provider} 不可用)`);
@@ -342,22 +417,54 @@ export function subagentModelDepsOf(ctx: Context): SubagentModelDeps {
           throw new Error(`Select an available model before sending a message. (model=${selected.model} 不可用)`);
         }
         await llm.resolveCallConfig(selected);
-        // AgentModel.select() 的底层实现本身:append 一条 log-only 的
-        // model/selection 事件;modelSelection 投影折叠出 next=selected。
-        appendSelection.call(liveSession, "model/selection", selected);
-        // best-effort 落盘;失败只 warn,不回滚内存中的选择。
-        if (typeof sessionsForFlush?.flush === "function") {
-          void sessionsForFlush.flush(liveSession).catch((error: unknown) => {
-            logger?.warn?.("[as-one] flush session after model switch failed:", error);
-          });
+
+        // 优先从 agent/created 缓存取 child Session(child scope 的 live Session
+        // 不在 root sessions store);取不到再回退 root sessions.get()。
+        const sessions = sessionsOf();
+        const cached = sessionCache.get(request.sessionId);
+        const session: ({ readonly header?: SessionHeaderLike } & Partial<WritableSessionLike>) | undefined =
+          cached ?? sessions?.get?.(request.sessionId);
+        if (session !== undefined && typeof session.append === "function") {
+          // 正在运行:原路径,直接 append model/selection。
+          const liveSession = session;
+          const appendSelection = session.append;
+          appendSelection.call(liveSession, "model/selection", selected);
+          if (typeof sessions?.flush === "function") {
+            void sessions.flush(liveSession).catch((error: unknown) => {
+              logger?.warn?.("[as-one] flush session after model switch failed:", error);
+            });
+          }
+          const defaults = defaultsOf();
+          if (defaults !== undefined) {
+            void defaults.saveSelection(selected).catch((error: unknown) => {
+              logger?.warn?.("[as-one] save default model failed:", error);
+            });
+          }
+          return { selected: { ...selected } };
         }
-        const defaults = defaultsOf();
-        if (defaults !== undefined) {
-          void defaults.saveSelection(selected).catch((error: unknown) => {
-            logger?.warn?.("[as-one] save default model failed:", error);
-          });
+
+        // 休眠:用户定案 C —— 发一条「本身就是模型切换提示」的唤醒消息,
+        // 冷恢复后 agent/created 里注册的 pre-step 拦截会写 model/selection
+        // 并 reject 该 turn,不调用 LLM。
+        const subagents = subagentsOf();
+        if (subagents === undefined) {
+          throw new SubagentSessionNotLiveError(request.sessionId, "宿主未提供 subagents 服务");
         }
-        return { selected: { ...selected } };
+        const requestId = newWakeId();
+        wakePending.set(requestId, { selection: selected });
+        try {
+          await subagents.prompt({
+            childSessionId: request.sessionId,
+            delivery: "queue",
+            requestId,
+            content: [{ type: "text", text: switchNoticeText(selected) }],
+          });
+          return { selected: { ...selected }, activated: true };
+        } catch (error) {
+          // prompt 失败(如 subagent/not-resumable)时清理未消费的标记并如实传播。
+          wakePending.delete(requestId);
+          throw error;
+        }
       });
       selectChains.set(request.sessionId, run.then(() => undefined, () => undefined));
       return run;
@@ -410,9 +517,8 @@ export function buildSubagentModelRoutes(deps: SubagentModelDeps): AsOneWebRoute
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         deps.logger?.warn?.(`[as-one] ${method} failed:`, err);
-        // 「子代理没在运行」是**状态不满足**,不是内部错误:返回 409 +
-        // 稳定错误码,UI 能据此把选择器置灰并给出可操作的说明,而不是
-        // 让用户对着一个 500 猜(用户 m03723 报的就是这个 500)。
+        // 「子代理没在运行且无法唤醒」是**状态不满足**,返回 409 + 稳定错误码;
+        // 正常休眠已走 subagents.prompt 唤醒,只有降级失败才到这里。
         if (err instanceof SubagentSessionNotLiveError) {
           writeJson(res, 409, fail("subagent_session_not_live", detail));
           return;
