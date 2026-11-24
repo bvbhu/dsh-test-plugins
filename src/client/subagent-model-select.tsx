@@ -342,13 +342,13 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
     : reasoning === undefined
       ? selected?.reasoningEffort
       : effectiveEffort === undefined
-        ? "default"
+        ? "Default"
         : reasoning.efforts.find((level) => level.id === effectiveEffort)?.name ?? effectiveEffort;
   const effortChoices: EffortChoice[] = reasoning === undefined
     ? []
     : [
       ...(reasoning.defaultEffort === undefined
-        ? [{ key: "provider-default", effort: undefined, label: "default" }]
+        ? [{ key: "provider-default", effort: undefined, label: "Default" }]
         : []),
       ...reasoning.efforts.map((level: SubagentModelReasoningEffort) => ({
         key: `effort:${level.id}`, effort: level.id, label: level.name,
