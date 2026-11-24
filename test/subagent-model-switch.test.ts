@@ -214,6 +214,10 @@ describe("subagentModelDepsOf.selectModel(绕过 subagent 守卫)", () => {
     expect(req.content).toHaveLength(1);
     expect(req.content[0]?.text).toContain("[model changed:");
     expect(req.content[0]?.text).toContain("deepseek-account/deepseek-flash");
+    // DSH deliverPrompt/submitAdmitted 会调用 signal.throwIfAborted(),必须给真 signal。
+    const signal = prompt.mock.calls[0]?.[1] as AbortSignal | undefined;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal?.aborted).toBe(false);
   });
 
   it("唤醒后 agent/created 注册 pre-step:命中 rpcId 写选择 + reject,其他消息 next()", async () => {
