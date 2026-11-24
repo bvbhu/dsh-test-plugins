@@ -138,7 +138,8 @@ interface SubagentsPromptLike {
       requestId: string;
       content: readonly { readonly type: "text"; readonly text: string }[];
     },
-    signal?: unknown,
+    /** DSH 契约必需:deliverPrompt/submitAdmitted 会调用 signal.throwIfAborted()。 */
+    signal: AbortSignal,
   ): Promise<unknown>;
 }
 
@@ -452,13 +453,14 @@ export function subagentModelDepsOf(ctx: Context): SubagentModelDeps {
         }
         const requestId = newWakeId();
         wakePending.set(requestId, { selection: selected });
+        const wakeAbort = new AbortController();
         try {
           await subagents.prompt({
             childSessionId: request.sessionId,
             delivery: "queue",
             requestId,
             content: [{ type: "text", text: switchNoticeText(selected) }],
-          });
+          }, wakeAbort.signal);
           return { selected: { ...selected }, activated: true };
         } catch (error) {
           // prompt 失败(如 subagent/not-resumable)时清理未消费的标记并如实传播。

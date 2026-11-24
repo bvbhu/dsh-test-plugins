@@ -43,12 +43,10 @@ import {
 
 import {
   fetchModelCatalog,
-  fetchSubagentSessionInfo,
   selectSubagentModel,
   type SubagentModelCatalog,
   type SubagentModelCatalogEntry,
   type SubagentModelReasoningEffort,
-  type SubagentSessionInfo,
 } from "./api.js";
 
 // ── 样式(照抄 ModelSelect.module.css;唯一差别是 class 前缀) ────────────
@@ -90,7 +88,6 @@ const SUBAGENT_MODEL_CSS = `
 .asone-submodel-check svg { width:14px; height:14px; }
 .asone-submodel-badge { margin-left:4px; }
 .asone-submodel-status { padding:8px; color:var(--dsw-alias-label-tertiary); font-size:12px; }
-.asone-submodel-live-note { margin:2px 4px; padding:7px 8px; border-radius:var(--dsw-radius-md); background:var(--dsw-alias-bg-secondary); color:var(--dsw-alias-label-secondary); font-size:12px; line-height:18px; }
 .asone-submodel-error { display:flex; align-items:center; gap:6px; padding:8px; color:var(--dsw-alias-label-secondary); font-size:12px; }
 .asone-submodel-retry { margin-left:auto; border:none; background:transparent; color:var(--dsw-alias-state-business-primary); cursor:pointer; font:inherit; }
 `;
@@ -186,27 +183,11 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<{ seq: number; text: string } | null>(null);
   const toastSeq = useRef(0);
-  const [sessionInfo, setSessionInfo] = useState<SubagentSessionInfo | null>(null);
-  // 休眠子代理现在也可切换(唤醒+拦截,用户定案 C);sessionLive 只用于提示文案。
-  const sessionLive = sessionInfo?.isLive !== false;
   // 会话 id 变了(切到别的子代理)就关掉菜单,避免拿 A 的目录给 B 用。
   const sidRef = useRef(sessionId ?? "");
   useEffect(() => {
-    if (sessionId === undefined || sessionId === "") {
-      setSessionInfo(null);
-      return;
-    }
-    let alive = true;
-    void fetchSubagentSessionInfo(sessionId)
-      .then((info) => { if (alive) setSessionInfo(info); })
-      .catch(() => { if (alive) setSessionInfo(null); });
-    return () => { alive = false; };
-  }, [sessionId]);
-
-  useEffect(() => {
     if (sidRef.current !== (sessionId ?? "")) {
       sidRef.current = sessionId ?? "";
-      setSessionInfo(null);
       setOpen(false);
       setCatalog(null);
       setQuery("");
@@ -428,12 +409,6 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
           )}
       </button>
 
-      {!sessionLive && (
-        <div className="asone-submodel-live-note" role="status">
-          子代理当前休眠;切换时会发一条提示唤醒它并仅切换模型,不执行任务。
-        </div>
-      )}
-
       {open && createPortal(
         <MenuSurface
           ref={menuRef}
@@ -603,5 +578,3 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
   );
 }
 
-/** 仅为类型对齐保留:host 兜底接口形状与此处查询一致(当前不发起请求)。 */
-export type { SubagentSessionInfo };
