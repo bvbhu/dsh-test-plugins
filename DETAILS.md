@@ -9,7 +9,7 @@
 
 ## 安装
 
-`dsh plugin --profile <name> add github:bvbhu/dsh-as-one`，或在插件管理器中启用。
+`dsh plugin --profile <name> add github:bvbhu/dsh-test-plugins#dsh-as-one`，或在插件管理器中启用。
 
 路径固定，没有配置文件、没有 YAML config：数据目录 `<homedir>/.as-one`，
 库 `<homedir>/.as-one/as-one.db`，请求日志 `<homedir>/.as-one/logs`。
