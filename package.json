@@ -11,6 +11,8 @@
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [
+    "DETAILS.md",
+    "README.md",
     "lib",
     "client",
     "cordis.patch.yml"
