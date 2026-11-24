@@ -8,12 +8,16 @@
  * —— 这正是 `AgentModel.select()` 的底层实现,且 core/session 的 append 无
  * subagent 守卫。
  *
- * 锁住三件事:
- *   1) 优先走 agent/created 缓存的 child Session(origin==='subagent' 的 child
- *      Session 在 root sessions store 查不到),再回退 sessions.get();
+ * 锁住四件事:
+ *   1) 运行时优先走 agent/created 缓存的 child Session(origin==='subagent' 的
+ *      child Session 在 root sessions store 查不到),再回退 sessions.get();
  *      写 'model/selection',不调 sessionController.selectModel(),不依赖 agents.get();
- *   2) 保留可用性校验(provider/model 不在目录里要抛错,且**不**写选择);
- *   3) 保留默认保存(agentDefaultModel.saveSelection),失败不影响主流程。
+ *   2) 保留可用性校验(provider/model 不在目录里要抛错,且**不**唤醒、**不**写选择);
+ *   3) 保留默认保存(agentDefaultModel.saveSelection),失败不影响主流程;
+ *   4) 休眠子代理走用户定案 C:发「本身就是切换提示」的唤醒消息(post 给
+ *      subagents.prompt,source.rpcId 作为标记),agent/created 里注册 pre-step
+ *      拦截该 turn → 写 'model/selection' 后 {kind:'reject'},不调 LLM;连唤醒
+ *      都失败时如实抛错(cleanup 标记),只有在无 subagents 服务时才 409。
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -134,7 +138,7 @@ describe("subagentModelDepsOf.selectModel(绕过 subagent 守卫)", () => {
     expect(sessionsGet).not.toHaveBeenCalled(); // 缓存命中,完全不查 root store
   });
 
-  it("agent/disposed 后缓存失效 → 抛错", async () => {
+  it("agent/disposed 后缓存失效 → 无 subagents 服务只能如实拒绝", async () => {
     const session = liveSession();
     const harness = ctxWithEvents({ sessions: { get: () => undefined }, llm: llm() });
     const deps = subagentModelDepsOf(harness.ctx);
@@ -143,14 +147,16 @@ describe("subagentModelDepsOf.selectModel(绕过 subagent 守卫)", () => {
 
     await expect(
       deps.selectModel({ sessionId: "gone", provider: "deepseek-account", model: "deepseek-flash" }),
-    ).rejects.toThrow(/当前未在运行/);
+    ).rejects.toBeInstanceOf(SubagentSessionNotLiveError);
   });
 
-  it("provider 不在目录 → 抛错且不写选择", async () => {
+  it("provider 不在目录 → 抛错且不写选择、不唤醒", async () => {
     const session = liveSession();
+    const prompt = vi.fn().mockResolvedValue(undefined);
     const ctx = ctxWith({
       sessions: { get: () => session },
       llm: llm({ listProviders: () => [{ id: "as-one" }] }),
+      subagents: { prompt },
     });
     const deps = subagentModelDepsOf(ctx);
 
@@ -158,13 +164,16 @@ describe("subagentModelDepsOf.selectModel(绕过 subagent 守卫)", () => {
       deps.selectModel({ sessionId: "child-1", provider: "deepseek-account", model: "deepseek-flash" }),
     ).rejects.toThrow(/provider=deepseek-account 不可用/);
     expect(session.append).not.toHaveBeenCalled();
+    expect(prompt).not.toHaveBeenCalled();
   });
 
-  it("model 不在目录 → 抛错且不写选择", async () => {
+  it("model 不在目录 → 抛错且不写选择、不唤醒", async () => {
     const session = liveSession();
+    const prompt = vi.fn().mockResolvedValue(undefined);
     const ctx = ctxWith({
       sessions: { get: () => session },
       llm: llm({ listModels: async () => [{ id: "other" }] }),
+      subagents: { prompt },
     });
     const deps = subagentModelDepsOf(ctx);
 
@@ -172,25 +181,110 @@ describe("subagentModelDepsOf.selectModel(绕过 subagent 守卫)", () => {
       deps.selectModel({ sessionId: "child-1", provider: "deepseek-account", model: "deepseek-flash" }),
     ).rejects.toThrow(/model=deepseek-flash 不可用/);
     expect(session.append).not.toHaveBeenCalled();
+    expect(prompt).not.toHaveBeenCalled();
   });
 
-  it("当前未在运行 → 抛错", async () => {
+  // 休眠子代理走用户定案 C:发「本身就是切换提示」的唤醒消息,恢复后
+  // agent/created 里注册的 pre-step 拦截 → 写 model/selection + reject。
+  it("休眠 → subagents.prompt 投递模型切换提示,返回 activated:true", async () => {
+    const prompt = vi.fn().mockResolvedValue(undefined);
+    const ctx = ctxWith({
+      sessions: { get: () => undefined }, // root store 查不到 child(休眠)
+      llm: llm(),
+      subagents: { prompt },
+    });
+    const deps = subagentModelDepsOf(ctx);
+
+    const value = await deps.selectModel({
+      sessionId: "cold", provider: "deepseek-account", model: "deepseek-flash",
+    });
+
+    expect(value).toEqual({
+      selected: { provider: "deepseek-account", model: "deepseek-flash" },
+      activated: true,
+    });
+    expect(prompt).toHaveBeenCalledTimes(1);
+    const req = prompt.mock.calls[0]?.[0] as {
+      childSessionId: string; delivery: string; requestId: string;
+      content: readonly { type: string; text: string }[];
+    };
+    expect(req.childSessionId).toBe("cold");
+    expect(req.delivery).toBe("queue");
+    expect(req.requestId).toMatch(/^as-one-model-switch-/);
+    expect(req.content).toHaveLength(1);
+    expect(req.content[0]?.text).toContain("[model changed:");
+    expect(req.content[0]?.text).toContain("deepseek-account/deepseek-flash");
+  });
+
+  it("唤醒后 agent/created 注册 pre-step:命中 rpcId 写选择 + reject,其他消息 next()", async () => {
+    const session = liveSession();
+    const flush = vi.fn().mockResolvedValue(true);
+    const defaults = { saveSelection: vi.fn().mockResolvedValue(undefined) };
+    const prompt = vi.fn().mockResolvedValue(undefined);
+    const harness = ctxWithEvents({
+      sessions: { get: () => undefined, flush },
+      llm: llm(),
+      subagents: { prompt },
+      agentDefaultModel: defaults,
+    });
+    const deps = subagentModelDepsOf(harness.ctx);
+
+    await deps.selectModel({ sessionId: "cold", provider: "deepseek-account", model: "deepseek-flash" });
+    const req = prompt.mock.calls[0]?.[0] as { requestId: string };
+    const requestId = req.requestId;
+
+    // 冷恢复后的 agent:带可注册 pre-step 的 ctx 与 live session。
+    const on = vi.fn();
+    harness.emit("agent/created", {
+      agent: { id: "cold", session, ctx: { on } },
+    });
+    expect(on).toHaveBeenCalledWith("agent/pre-step", expect.any(Function), { prepend: true });
+    const listener = on.mock.calls[0]?.[1] as (
+      payload: { messages: readonly { source?: { rpcId?: string } }[] },
+      next: () => Promise<{ kind: string }>,
+    ) => Promise<{ kind: string }>;
+    const next = vi.fn().mockResolvedValue({ kind: "enter" });
+
+    // 命中唤醒消息 → 写选择 + reject,不 next。
+    const decision = await listener({ messages: [{ source: { rpcId: requestId } }] }, next);
+    expect(decision).toEqual({ kind: "reject" });
+    expect(next).not.toHaveBeenCalled();
+    expect(session.append).toHaveBeenCalledWith("model/selection", {
+      provider: "deepseek-account", model: "deepseek-flash",
+    });
+    expect(flush).toHaveBeenCalledWith(session);
+    expect(defaults.saveSelection).toHaveBeenCalledWith({
+      provider: "deepseek-account", model: "deepseek-flash",
+    });
+
+    // 其他消息 → 照常 next(),不再写选择。
+    session.append.mockClear();
+    const other = await listener({ messages: [{ source: { rpcId: "unrelated" } }] }, next);
+    expect(other).toEqual({ kind: "enter" });
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(session.append).not.toHaveBeenCalled();
+  });
+
+  it("subagents.prompt 失败(如 not-resumable)→ 如实抛错,不谎称 activated", async () => {
+    const prompt = vi.fn().mockRejectedValue(new Error("subagent/not-resumable"));
+    const ctx = ctxWith({
+      sessions: { get: () => undefined },
+      llm: llm(),
+      subagents: { prompt },
+    });
+    const deps = subagentModelDepsOf(ctx);
+
+    await expect(
+      deps.selectModel({ sessionId: "cold", provider: "deepseek-account", model: "deepseek-flash" }),
+    ).rejects.toThrow(/not-resumable/);
+  });
+
+  // 宿主未提供 subagents 服务 ⇒ 连唤醒都做不到,只能如实 409(不是笼统 500)。
+  it("无 subagents 服务且休眠 → SubagentSessionNotLiveError(409 可判别)", async () => {
     const ctx = ctxWith({ sessions: { get: () => undefined }, llm: llm() });
     const deps = subagentModelDepsOf(ctx);
     await expect(
-      deps.selectModel({ sessionId: "cold", provider: "p", model: "m" }),
-    ).rejects.toThrow(/当前未在运行/);
-  });
-
-  // 2026-11-24 (m03723):「没有 live Session」原来是笼统 500,用户只能对着
-  // 失败猜。宿主对子代理会话的生命周期是独占的(resolveAgent 返回
-  // session/agent-busy +「use subagent delivery」),所以必须**如实**告诉
-  // 用户「它没在运行」,并给出可操作的话;路由层据此回 409 而非 500。
-  it("未运行时抛的是可判别的 SubagentSessionNotLiveError(不是普通 Error)", async () => {
-    const ctx = ctxWith({ sessions: { get: () => undefined }, llm: llm() });
-    const deps = subagentModelDepsOf(ctx);
-    await expect(
-      deps.selectModel({ sessionId: "cold", provider: "p", model: "m" }),
+      deps.selectModel({ sessionId: "cold", provider: "deepseek-account", model: "deepseek-flash" }),
     ).rejects.toBeInstanceOf(SubagentSessionNotLiveError);
   });
 
