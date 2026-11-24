@@ -15,8 +15,9 @@
  *
  * 数据流:目录/切换都走 as-one 自家 HTTP API(`client/api.ts`)。目录由 host
  * 中转宿主 `sessionController.modelCatalog()`;切换不能走宿主的 `selectModel`
- * (它对子代理会话硬拒绝),而是写入 `agent/created` 期间缓存的 child Session
- * 的 `model/selection` 事件。休眠子代理返回 409,选择器置灰并提示先启动它。
+ * (它对子代理会话硬拒绝):运行时写入 `agent/created` 缓存的 child Session;
+ * 休眠时发一条「本身就是模型切换提示」的唤醒消息冷恢复子代理,恢复后第一个
+ * pre-step 拦截并写 `model/selection`、取消请求,不执行任务、不发 LLM(用户定案 C)。
  *
  * 视觉:严格照抄 `ModelSelect.module.css`,颜色/圆角/阴影全走 `--dsw-*`
  * token;图标/Input/Toast/MenuSurface 用 primitives 根导出(宿主已注入)。
@@ -186,7 +187,7 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
   const [toast, setToast] = useState<{ seq: number; text: string } | null>(null);
   const toastSeq = useRef(0);
   const [sessionInfo, setSessionInfo] = useState<SubagentSessionInfo | null>(null);
-  // `undefined` = 还没确认(按可操作处理);false = 明确休眠,置灰。
+  // 休眠子代理现在也可切换(唤醒+拦截,用户定案 C);sessionLive 只用于提示文案。
   const sessionLive = sessionInfo?.isLive !== false;
   // 会话 id 变了(切到别的子代理)就关掉菜单,避免拿 A 的目录给 B 用。
   const sidRef = useRef(sessionId ?? "");
@@ -311,7 +312,6 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
   };
 
   const show = (): void => {
-    if (!sessionLive) return;
     setQuery("");
     setHighlighted(0);
     setPane(currentChoice === undefined ? "model" : "root");
@@ -323,7 +323,6 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
   };
 
   const submit = (selection: Selection): void => {
-    if (!sessionLive) return;
     if (sameSelection(selected, selection)) {
       close();
       return;
@@ -411,9 +410,8 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
         aria-label={`模型:${triggerLabel}`}
         aria-haspopup="menu"
         aria-expanded={open}
-        title={sessionLive ? triggerLabel : "子代理当前未在运行,模型只能在其运行时切换"}
+        title={triggerLabel}
         aria-busy={busy}
-        disabled={!sessionLive}
         onClick={() => { if (open) close(); else show(); }}
       >
         <IconDataOutlineRegular className="asone-submodel-trigger-icon" size={16} />
@@ -432,7 +430,7 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
 
       {!sessionLive && (
         <div className="asone-submodel-live-note" role="status">
-          子代理当前未在运行;发一条消息让它启动后再切模型。
+          子代理当前休眠;切换时会发一条提示唤醒它并仅切换模型,不执行任务。
         </div>
       )}
 
