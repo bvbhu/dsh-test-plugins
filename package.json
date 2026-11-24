@@ -10,6 +10,7 @@
     "./icon": "./icon.svg"
   },
   "files": [
+    "DETAILS.md",
     "index.js",
     "cordis.patch.yml",
     "locale/*.json",
