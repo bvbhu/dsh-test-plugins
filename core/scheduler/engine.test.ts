@@ -376,8 +376,8 @@ describe("Scheduler.due-first 档位排序", () => {
     expect(plan[0]!.free).toBe(true);
     expect(plan[1]!.free).toBe(false);
     expect(plan[0]!.reason).toBe("T1 免费档(名单第 1 位)");
-    expect(plan[1]!.reason).toContain("T2 赠送额度 到期");
-    expect(plan[2]!.reason).toBe("T2 赠送额度 到期 2026-11-09 00:00:00");
+    expect(plan[1]!.reason).toContain("T3 消耗档 到期");
+    expect(plan[2]!.reason).toBe("T3 消耗档 到期 2026-11-09 00:00:00");
     // 未知到期 → 排本层末
     expect(plan[4]!.reason).toBe("T3 消耗档 到期未知(排本层末)");
     // 到期数值:longcat 10-27 早于 tokenrhythm 11-09
@@ -643,7 +643,7 @@ describe("Scheduler.due-first 档位排序", () => {
       "workbuddy/deepseek-v4.1-flash",
       "trae/deepseek-v4.1-flash",
     ]);
-    expect(plan[0]!.reason).toBe("T2 赠送额度 到期 2026-11-02 00:00:00");
+    expect(plan[0]!.reason).toBe("T3 消耗档 到期 2026-11-02 00:00:00");
     // 反过来:trae 更早到期 → trae 先
     repo.setQuota("trae/bvbhu", { expires_at: expiryEpoch("2026-10-30")! });
     sched.invalidate();
@@ -711,8 +711,8 @@ describe("Scheduler.due-first 档位排序", () => {
       "opencsg/deepseek-v4.1-flash-1017", // 12-01 静态 P2
       "unknown/m", // 无到期 → T3
     ]);
-    expect(plan[0]!.reason).toBe("T2 赠送额度 到期 2026-11-28 00:00:00");
-    expect(plan[1]!.reason).toBe("T2 赠送额度 到期 2026-12-01 00:00:00");
+    expect(plan[0]!.reason).toBe("T3 消耗档 到期 2026-11-28 00:00:00");
+    expect(plan[1]!.reason).toBe("T3 消耗档 到期 2026-12-01 00:00:00");
     expect(plan[2]!.reason).toBe("T3 消耗档 到期未知(排本层末)");
   });
 
@@ -759,7 +759,7 @@ describe("Scheduler.due-first 档位排序", () => {
       sched.chain("wb-vs-trae2", { now: at(23, 0) }).map((c) => c.endpoint.realModelKey),
     ).toEqual(["workbuddy/deepseek-v4.1-flash", "trae/deepseek-v4.1-flash"]);
     const plan = sched.planMembers("wb-vs-trae2", { now: at(23, 0) });
-    expect(plan[0]!.reason).toBe("T2 赠送额度 到期 2026-10-30 00:00:00");
+    expect(plan[0]!.reason).toBe("T3 消耗档 到期 2026-10-30 00:00:00");
   });
 });
 

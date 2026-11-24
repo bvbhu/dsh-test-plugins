@@ -789,10 +789,7 @@ export class Scheduler {
         reasons.set(mid, `T1 免费档(名单第 ${this._freeRankOf(mid) + 1} 位)`);
         continue;
       }
-      const tier =
-        isGrantTier(members[src]![0], members[src]![1]) || expiry.has(mid)
-          ? GRANT_TIER
-          : CONSUME_TIER;
+      const tier = isGrantTier(members[src]![0], members[src]![1]) ? GRANT_TIER : CONSUME_TIER;
       const exp = expiry.get(mid);
       if (exp !== undefined && exp !== null && Number.isFinite(exp)) {
         reasons.set(mid, `${TIER_NAMES[tier]} 到期 ${formatLocal(exp)}`);
