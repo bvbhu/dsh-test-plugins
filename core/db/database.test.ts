@@ -15,7 +15,7 @@ afterEach(() => {
 });
 
 describe("openDatabase(:memory:)", () => {
-	it("建出 7 张表并种上版本行", () => {
+	it("建出 8 张表并种上版本行", () => {
 		const rows = db.raw
 			.prepare(
 				"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -29,6 +29,7 @@ describe("openDatabase(:memory:)", () => {
 			"setting",
 			"stats_daily",
 			"stats_external_daily",
+			"subagent_model_pending",
 		]);
 		expect(db.setting.get("version")?.v).toBe("4");
 	});
@@ -472,5 +473,42 @@ describe("setting", () => {
 		expect(db.setting.get("k1")?.v).toBe("v2");
 		db.setting.delete("k1");
 		expect(db.setting.get("k1")).toBeUndefined();
+	});
+});
+
+describe("subagent_model_pending", () => {
+	it("get/set(upsert)/delete 往返,reasoning_effort 允许 NULL", () => {
+		expect(db.subagentModelPending.get("child-1")).toBeUndefined();
+		db.subagentModelPending.set({
+			session_id: "child-1",
+			provider: "deepseek-account",
+			model: "deepseek-flash",
+			reasoning_effort: null,
+			changed_at: 1700000000000,
+		});
+		expect(db.subagentModelPending.get("child-1")).toEqual({
+			session_id: "child-1",
+			provider: "deepseek-account",
+			model: "deepseek-flash",
+			reasoning_effort: null,
+			changed_at: 1700000000000,
+		});
+		// upsert:同 session 覆盖 provider/model/effort/changed_at,不新增行。
+		db.subagentModelPending.set({
+			session_id: "child-1",
+			provider: "sensenova",
+			model: "deepseek-v4-pro",
+			reasoning_effort: "high",
+			changed_at: 1700000009999,
+		});
+		expect(db.subagentModelPending.get("child-1")).toEqual({
+			session_id: "child-1",
+			provider: "sensenova",
+			model: "deepseek-v4-pro",
+			reasoning_effort: "high",
+			changed_at: 1700000009999,
+		});
+		db.subagentModelPending.delete("child-1");
+		expect(db.subagentModelPending.get("child-1")).toBeUndefined();
 	});
 });

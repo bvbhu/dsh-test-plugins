@@ -141,6 +141,23 @@ CREATE TABLE IF NOT EXISTS setting (
     v TEXT
 );
 INSERT OR IGNORE INTO setting (k, v) VALUES ('version', '4');
+
+-- ============================================================
+-- subagent_model_pending 表 —— as-one 自有扩展(休眠子代理的待切换模型)
+-- ============================================================
+-- 用户定案 A(2026-11-24):continuable 子代理休眠时没有 live Session,不能
+-- 直接 append model/selection;若用 subagents.prompt 唤醒并拦截,宿主会在
+-- turn 结束时向父会话投递 source.kind='subagent-settled' 结算通知(污染父会话)。
+-- 因此把「目标选择」持久化在本表:切换当刻 UI 立即显示目标模型,真正写入
+-- child Session 延迟到该子代理**下次真实唤醒**(agent/created)时 drain。
+-- 进程重启后行还在,不会丢;drain 完即删,不留陈旧选择。
+CREATE TABLE IF NOT EXISTS subagent_model_pending (
+    session_id       TEXT PRIMARY KEY,            -- 子代理会话 id
+    provider         TEXT NOT NULL,
+    model            TEXT NOT NULL,
+    reasoning_effort TEXT,                        -- NULL = 用 provider 默认档
+    changed_at       INTEGER NOT NULL             -- epoch ms,写入时刻(不用 updated_at:D1 幽灵列回归防护禁止)
+);
 `;
 
 /**

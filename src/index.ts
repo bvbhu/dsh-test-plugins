@@ -192,8 +192,12 @@ async function startAsOne(ctx: Context): Promise<void> {
       // 面板要先建出来 —— 预热门要借它的 `syncAllQuota(true)` 打真实探针。
       const panelRoutes = buildPanelRoutes(runtime);
       // 子代理会话模型选择器:continuable 子代理页原生选择器被硬禁用,
-      // 这里挂三条中转路由(模型目录/会话信息/切换),复用宿主 sessionController。
-      const subagentModelRoutes = buildSubagentModelRoutes(subagentModelDepsOf(ctx));
+      // 这里挂中转路由(模型目录/会话信息/pending 选择/切换),复用宿主 sessionController。
+      // 注入 runtime.db.subagentModelPending:休眠子代理的待切换选择持久化在这里,
+      // 下次真实 agent/created 时 drain 写入 child Session 的 model/selection。
+      const subagentModelRoutes = buildSubagentModelRoutes(
+        subagentModelDepsOf(ctx, runtime.db.subagentModelPending),
+      );
       const gatewayRoutes = buildGatewayRoutes(runtime, {
         logger: ctx.logger as unknown as Pick<Console, "warn" | "error">,
         warmup,
