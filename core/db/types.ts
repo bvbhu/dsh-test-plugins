@@ -131,11 +131,29 @@ export interface SettingRow {
 	v: string | null;
 }
 
-/** 六张表行类型的联合(用于泛型 CRUD 装配)。 */
+/**
+ * subagent_model_pending 表:休眠子代理的待切换模型(as-one 自有扩展)。
+ *
+ * 切换当刻写入本表,UI 立即显示目标模型;真正 `model/selection` 事件延迟到
+ * 下次真实 agent/created 时 drain(见 src/subagent-model-api.ts)。重启不丢。
+ */
+export interface SubagentModelPendingRow {
+	session_id: string;
+	provider: string;
+	model: string;
+	/** NULL = 用 provider 默认思考档。 */
+	reasoning_effort: string | null;
+	/** epoch ms(不用 updated_at:D1 幽灵列回归防护禁止) */
+	changed_at: number;
+}
+
+/** 各表行类型的联合(用于泛型 CRUD 装配)。 */
 export type AnyRow =
 	| ProviderRow
 	| CredentialRow
 	| RealModelRow
 	| LogicalModelRow
 	| StatsDailyRow
-	| SettingRow;
+	| StatsExternalRow
+	| SettingRow
+	| SubagentModelPendingRow;

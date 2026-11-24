@@ -25,7 +25,7 @@ function indexNames(db: DatabaseSync, table: string): string[] {
 }
 
 describe("SCHEMA_V7 — 结构", () => {
-	it("建出 7 张表(provider/credential/real_model/logical_model/stats_daily/stats_external_daily/setting)", () => {
+	it("建出 8 张表(provider/credential/real_model/logical_model/stats_daily/stats_external_daily/setting/subagent_model_pending)", () => {
 		const db = new DatabaseSync(":memory:");
 		db.exec(SCHEMA_V7);
 		expect(tableNames(db)).toEqual([
@@ -36,11 +36,12 @@ describe("SCHEMA_V7 — 结构", () => {
 			"setting",
 			"stats_daily",
 			"stats_external_daily",
+			"subagent_model_pending",
 		]);
 		db.close();
 	});
 
-	it("总列数 46(按实际 SQL 核对;stats_external_daily 8 列)", () => {
+	it("总列数 51(按实际 SQL 核对;stats_external_daily 8 列 / subagent_model_pending 5 列)", () => {
 		const db = new DatabaseSync(":memory:");
 		db.exec(SCHEMA_V7);
 		const perTable: Record<string, number> = {};
@@ -53,9 +54,10 @@ describe("SCHEMA_V7 — 结构", () => {
 			setting: 2,
 			stats_daily: 12,
 			stats_external_daily: 8,
+			subagent_model_pending: 5,
 		});
 		const total = Object.values(perTable).reduce((a, b) => a + b, 0);
-		expect(total).toBe(46);
+		expect(total).toBe(51);
 		db.close();
 	});
 
@@ -104,6 +106,13 @@ describe("SCHEMA_V7 — 结构", () => {
 			"ttft_requests",
 		]);
 		expect(columnNames(db, "setting")).toEqual(["k", "v"]);
+		expect(columnNames(db, "subagent_model_pending")).toEqual([
+			"session_id",
+			"provider",
+			"model",
+			"reasoning_effort",
+			"changed_at",
+		]);
 		db.close();
 	});
 

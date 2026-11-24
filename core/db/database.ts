@@ -25,6 +25,7 @@ import type {
 	StatsDailyRow,
 	SettingRow,
 	StatsExternalRow,
+	SubagentModelPendingRow,
 } from "./types.js";
 
 /** node:sqlite 接受的绑定参数类型。 */
@@ -182,6 +183,17 @@ export interface AsOneDatabase {
 		entries(prefix: string): SettingRow[];
 		set(key: string, value: string | null): void;
 		delete(key: string): void;
+	};
+
+	// ---- subagent_model_pending(休眠子代理待切换模型)----------------
+	/**
+	 * 每行一个休眠子代理的目标选择,ON CONFLICT 覆盖(后切为准)。
+	 * 真正写 child Session 的 `model/selection` 由 host 在 agent/created 时 drain。
+	 */
+	subagentModelPending: {
+		get(sessionId: string): SubagentModelPendingRow | undefined;
+		set(row: SubagentModelPendingRow): void;
+		delete(sessionId: string): void;
 	};
 }
 
@@ -670,6 +682,35 @@ export function openDatabase(target: string | ":memory:"): AsOneDatabase {
 				deleteRow("setting", "k = ?", [key]);
 			},
 		},
+
+		subagentModelPending: {
+			get(sessionId) {
+				return raw
+					.prepare("SELECT * FROM subagent_model_pending WHERE session_id = ?")
+					.get(sessionId) as SubagentModelPendingRow | undefined;
+			},
+			set(row) {
+				raw.prepare(
+					`INSERT INTO subagent_model_pending
+						(session_id, provider, model, reasoning_effort, changed_at)
+					 VALUES (?, ?, ?, ?, ?)
+					 ON CONFLICT (session_id) DO UPDATE SET
+						provider = excluded.provider,
+						model = excluded.model,
+						reasoning_effort = excluded.reasoning_effort,
+						changed_at = excluded.changed_at`,
+				).run(
+					row.session_id,
+					row.provider,
+					row.model,
+					row.reasoning_effort,
+					row.changed_at,
+				);
+			},
+			delete(sessionId) {
+				deleteRow("subagent_model_pending", "session_id = ?", [sessionId]);
+			},
+		},
 	};
 
 	return db;
@@ -684,4 +725,5 @@ export type {
 	StatsDailyRow,
 	SettingRow,
 	StatsExternalRow,
+	SubagentModelPendingRow,
 };
