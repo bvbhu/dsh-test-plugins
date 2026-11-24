@@ -342,16 +342,13 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
     : reasoning === undefined
       ? selected?.reasoningEffort
       : effectiveEffort === undefined
-        ? "默认"
-        : reasoning.efforts.find((level) => level.id === effectiveEffort)?.name
-          // 有些模型的 defaultEffort 是哨兵 id(如 "default"),并不出现在 efforts
-          // 列表里;此时显示成原始 id(小写 "default")很怪,按“默认档”本地化为「默认」。
-          ?? (effectiveEffort === reasoning.defaultEffort ? "默认" : effectiveEffort);
+        ? "default"
+        : reasoning.efforts.find((level) => level.id === effectiveEffort)?.name ?? effectiveEffort;
   const effortChoices: EffortChoice[] = reasoning === undefined
     ? []
     : [
       ...(reasoning.defaultEffort === undefined
-        ? [{ key: "provider-default", effort: undefined, label: "默认" }]
+        ? [{ key: "provider-default", effort: undefined, label: "default" }]
         : []),
       ...reasoning.efforts.map((level: SubagentModelReasoningEffort) => ({
         key: `effort:${level.id}`, effort: level.id, label: level.name,
