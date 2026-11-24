@@ -140,12 +140,18 @@ export interface SubagentSessionInfo {
   mode: "one-shot" | "continuable" | "unknown" | null;
   parentSessionId: string | null;
   /**
-   * 该会话此刻是否有可写 live Session。`false` ⇒ 子代理休眠,切换会先发
-   * 一条「模型切换提示」唤醒它,再在恢复后的第一个 step 拦截并写入选择,
-   * 不执行任务、不发 LLM 请求(用户定案 C)。UI 据此提示「将唤醒子代理」。
+   * 该会话此刻是否有可写 live Session。`false` ⇒ 子代理休眠,切换把目标
+   * 选择持久化到 as-one SQLite,UI 立即显示,下次真实唤醒时 drain(用户定案 A)。
    */
   isLive?: boolean;
 }
+
+/**
+ * 休眠子代理尚未 drain 的待切换选择(持久化在 as-one SQLite)。
+ * UI 用它「等待期间显示模型显示器」:目标模型即时呈现,真正写入 child Session
+ * 延迟到该子代理下次真实唤醒。
+ */
+export type SubagentPendingSelection = SubagentModelSelection;
 
 /** DSH 原生模型目录(经 host sessionController.modelCatalog 中转)。 */
 export function fetchModelCatalog(): Promise<SubagentModelCatalog> {
@@ -157,6 +163,13 @@ export function fetchSubagentSessionInfo(sessionId: string): Promise<SubagentSes
   return post<SubagentSessionInfo>("getSubagentSessionInfo", [sessionId]);
 }
 
+/** 读取休眠子代理尚未 drain 的待切换选择(null 表示没有 pending)。 */
+export function fetchSubagentPendingSelection(
+  sessionId: string,
+): Promise<SubagentPendingSelection | null> {
+  return post<SubagentPendingSelection | null>("getPendingSelection", [sessionId]);
+}
+
 /**
  * 切换会话模型。
  *
@@ -164,9 +177,10 @@ export function fetchSubagentSessionInfo(sessionId: string): Promise<SubagentSes
  * child scope 的可写 Session。宿主在子代理**运行期间**经 `agent/created`
  * 暴露 `agent.session`,as-one 缓存它并 `append("model/selection", …)`
  * (DSH 自己的 `subagent-model-selection-settings` 就是这么写 child 的)。
- * 子代理休眠时经 `subagents.prompt` 发一条模型切换提示唤醒它,恢复后第一个
- * pre-step 拦截、写选择并取消请求,不执行任务;返回值 `activated:true`。
- * 只有连唤醒都做不到时才返回 409 `subagent_session_not_live`。
+ * 子代理休眠时把目标选择持久化到 as-one SQLite(`subagent_model_pending`),
+ * 不唤醒、不写入父会话;UI 立即显示目标模型,下次真实唤醒时 drain。返回值
+ * `pending:true` 表示走了持久化路径。只有连 pending store 都拿不到时才返回
+ * 409 `subagent_session_not_live`。
  */
 export function selectSubagentModel(
   sessionId: string,

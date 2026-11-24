@@ -6,7 +6,7 @@
  * `model selection is unavailable for addressed subagent sessions`,
  * `ModelSelect.tsx:217 if (!available) return null`)。而 continuation 子代理
  * 会话有正常的输入框(与父会话一致),用户定案要在这里放一个**一模一样**的
- * 控件 —— 位置(`conversation.input.left`)、两级菜单(模型/思考强度)、
+ * 控件 —— 位置(`conversation.input.right`,提交按钮前的紧凑控件)、两级菜单(模型/思考强度)、
  * provider 分组、>4 项搜索、勾选态、Toast 报错全部照抄原生。
  *
  * 为什么只在 continu able 渲染:one-shot / unknown 子代理没有输入框
@@ -16,8 +16,9 @@
  * 数据流:目录/切换都走 as-one 自家 HTTP API(`client/api.ts`)。目录由 host
  * 中转宿主 `sessionController.modelCatalog()`;切换不能走宿主的 `selectModel`
  * (它对子代理会话硬拒绝):运行时写入 `agent/created` 缓存的 child Session;
- * 休眠时发一条「本身就是模型切换提示」的唤醒消息冷恢复子代理,恢复后第一个
- * pre-step 拦截并写 `model/selection`、取消请求,不执行任务、不发 LLM(用户定案 C)。
+ * 休眠时把目标选择持久化到 as-one SQLite(`subagent_model_pending`),不唤醒、
+ * 不给父会话写任何消息;UI 立即显示目标模型(等待期间也显示),下次该子代理
+ * 真实唤醒时 host drain 写入 `model/selection`(用户定案 A)。
  *
  * 视觉:严格照抄 `ModelSelect.module.css`,颜色/圆角/阴影全走 `--dsw-*`
  * token;图标/Input/Toast/MenuSurface 用 primitives 根导出(宿主已注入)。
@@ -43,23 +44,25 @@ import {
 
 import {
   fetchModelCatalog,
+  fetchSubagentPendingSelection,
   selectSubagentModel,
   type SubagentModelCatalog,
   type SubagentModelCatalogEntry,
   type SubagentModelReasoningEffort,
+  type SubagentPendingSelection,
 } from "./api.js";
 
 // ── 样式(照抄 ModelSelect.module.css;唯一差别是 class 前缀) ────────────
 
 const CSS_ID = "as-one-subagent-model-styles";
 const SUBAGENT_MODEL_CSS = `
-.asone-submodel-root { display: inline-flex; min-width: 0; }
+.asone-submodel-root { min-width:0; position:relative; }
 .asone-submodel-trigger { anchor-name:var(--dsh-submodel-anchor); display:flex; align-items:center; gap:4px; min-width:0; max-width:360px; height:28px; padding:0 4px 0 8px; border:none; border-radius:var(--dsw-radius-sm); background:transparent; color:var(--dsw-alias-label-secondary); font-size:13px; line-height:20px; font-weight:400; cursor:pointer; }
 .asone-submodel-trigger:hover { background:var(--dsw-alias-interactive-bg-hover); }
 .asone-submodel-trigger:focus-visible { outline:none; box-shadow:0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)); }
 .asone-submodel-trigger:disabled { opacity:.5; cursor:default; }
-.asone-submodel-trigger-label { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.asone-submodel-trigger-effort { flex-shrink:1000; color:var(--dsw-alias-label-caption); }
+.asone-submodel-trigger-label { display:var(--dsh-composer-model-text-display,block); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.asone-submodel-trigger-effort { display:var(--dsh-composer-model-text-display,block); flex-shrink:1000; color:var(--dsw-alias-label-caption); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .asone-submodel-trigger-icon { display:var(--dsh-composer-model-icon-display, none); flex:0 0 auto; }
 .asone-submodel-chevron { flex:0 0 auto; color:var(--dsw-alias-label-caption); transition:transform 120ms ease; }
 .asone-submodel-chevron-open { transform:rotate(180deg); }
@@ -171,7 +174,36 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
 
   const subagentProjection = useProjection?.("subagent");
   const modelProjection = useProjection?.("modelSelection");
-  const selected = currentSelection(modelProjection);
+  const projectionSelected = currentSelection(modelProjection);
+
+  /**
+   * 休眠子代理的待切换选择(as-one SQLite 持久化)。它代表用户最近的切换意图,
+   * 优先于 modelSelection 投影显示 —— 这样休眠时切完模型,UI「等待期间」也
+   * 立即显示目标模型,真正写入 child Session 延迟到下次真实唤醒时 drain。
+   */
+  const [pending, setPending] = useState<SubagentPendingSelection | null>(null);
+
+  // 会话切换时重新读取该子代理的 pending 选择。
+  useEffect(() => {
+    const sid = sessionId ?? "";
+    if (sid === "") {
+      setPending(null);
+      return;
+    }
+    let cancelled = false;
+    void fetchSubagentPendingSelection(sid)
+      .then((value) => { if (!cancelled) setPending(value); })
+      .catch(() => { if (!cancelled) setPending(null); });
+    return () => { cancelled = true; };
+  }, [sessionId]);
+
+  const selected: Selection | null = pending !== null
+    ? {
+        provider: pending.provider,
+        model: pending.model,
+        ...(pending.reasoningEffort === undefined ? {} : { reasoningEffort: pending.reasoningEffort }),
+      }
+    : projectionSelected;
 
   const [open, setOpen] = useState(false);
   const [pane, setPane] = useState<Pane>("root");
@@ -316,7 +348,16 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
       selection.model,
       selection.reasoningEffort,
     )
-      .then(() => { close(); })
+      .then(() => {
+        // 立即把目标模型设为显示态(等待期间显示):运行态由投影同步,休眠态
+        // 由 pending 驱动。乐观写入 pending,避免等待投影/drain 的闪烁。
+        setPending({
+          provider: selection.provider,
+          model: selection.model,
+          ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+        });
+        close();
+      })
       .catch((err: unknown) => {
         toastSeq.current += 1;
         setToast({
