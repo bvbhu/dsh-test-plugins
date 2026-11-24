@@ -769,10 +769,11 @@ export class Scheduler {
     const keys: number[][] = [];
     for (let i = 0; i < n; i++) {
       const mid = midOf(i);
+      const hasExpiry = expiry.has(mid);
       if (this._degraded(members[i]!, logicalName, now)) keys.push([DEGRADED_TIER, 0, Infinity]);
       else if (this._isFreeTier(members[i]![0], members[i]![1], now))
         keys.push([FREE_TIER, this._freeRankOf(mid), 0]);
-      else if (isGrantTier(members[i]![0], members[i]![1]))
+      else if (isGrantTier(members[i]![0], members[i]![1]) || hasExpiry)
         keys.push([GRANT_TIER, 0, expiry.get(mid) ?? UNKNOWN_EXPIRY]);
       else keys.push([CONSUME_TIER, 0, expiry.get(mid) ?? UNKNOWN_EXPIRY]);
     }
@@ -788,7 +789,10 @@ export class Scheduler {
         reasons.set(mid, `T1 免费档(名单第 ${this._freeRankOf(mid) + 1} 位)`);
         continue;
       }
-      const tier = isGrantTier(members[src]![0], members[src]![1]) ? GRANT_TIER : CONSUME_TIER;
+      const tier =
+        isGrantTier(members[src]![0], members[src]![1]) || expiry.has(mid)
+          ? GRANT_TIER
+          : CONSUME_TIER;
       const exp = expiry.get(mid);
       if (exp !== undefined && exp !== null && Number.isFinite(exp)) {
         reasons.set(mid, `${TIER_NAMES[tier]} 到期 ${formatLocal(exp)}`);
