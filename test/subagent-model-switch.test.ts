@@ -18,7 +18,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import type { Context } from "../src/context-types.js";
-import { subagentModelDepsOf } from "../src/subagent-model-api.js";
+import { SubagentSessionNotLiveError, subagentModelDepsOf } from "../src/subagent-model-api.js";
 
 function ctxWith(services: Record<string, unknown>): Context {
   const logger = { warn: vi.fn() };
@@ -143,7 +143,7 @@ describe("subagentModelDepsOf.selectModel(绕过 subagent 守卫)", () => {
 
     await expect(
       deps.selectModel({ sessionId: "gone", provider: "deepseek-account", model: "deepseek-flash" }),
-    ).rejects.toThrow(/没有 live Session/);
+    ).rejects.toThrow(/当前未在运行/);
   });
 
   it("provider 不在目录 → 抛错且不写选择", async () => {
@@ -174,12 +174,45 @@ describe("subagentModelDepsOf.selectModel(绕过 subagent 守卫)", () => {
     expect(session.append).not.toHaveBeenCalled();
   });
 
-  it("没有 live Session → 抛错", async () => {
+  it("当前未在运行 → 抛错", async () => {
     const ctx = ctxWith({ sessions: { get: () => undefined }, llm: llm() });
     const deps = subagentModelDepsOf(ctx);
     await expect(
       deps.selectModel({ sessionId: "cold", provider: "p", model: "m" }),
-    ).rejects.toThrow(/没有 live Session/);
+    ).rejects.toThrow(/当前未在运行/);
+  });
+
+  // 2026-11-24 (m03723):「没有 live Session」原来是笼统 500,用户只能对着
+  // 失败猜。宿主对子代理会话的生命周期是独占的(resolveAgent 返回
+  // session/agent-busy +「use subagent delivery」),所以必须**如实**告诉
+  // 用户「它没在运行」,并给出可操作的话;路由层据此回 409 而非 500。
+  it("未运行时抛的是可判别的 SubagentSessionNotLiveError(不是普通 Error)", async () => {
+    const ctx = ctxWith({ sessions: { get: () => undefined }, llm: llm() });
+    const deps = subagentModelDepsOf(ctx);
+    await expect(
+      deps.selectModel({ sessionId: "cold", provider: "p", model: "m" }),
+    ).rejects.toBeInstanceOf(SubagentSessionNotLiveError);
+  });
+
+  it("isSessionLive:休眠为 false,agent/created 之后为 true,disposed 之后回到 false", () => {
+    const session = liveSession();
+    const harness = ctxWithEvents({ sessions: { get: () => undefined }, llm: llm() });
+    const deps = subagentModelDepsOf(harness.ctx);
+
+    expect(deps.isSessionLive("child-9")).toBe(false);
+
+    harness.emit("agent/created", { agent: { id: "child-9", session: { ...session, id: "child-9" } } });
+    expect(deps.isSessionLive("child-9")).toBe(true);
+
+    harness.emit("agent/disposed", { agent: { id: "child-9" } });
+    expect(deps.isSessionLive("child-9")).toBe(false);
+  });
+
+  it("isSessionLive:root sessions.get 提供的可写 Session 也算活着", () => {
+    const session = liveSession();
+    const ctx = ctxWith({ sessions: { get: () => session }, llm: llm() });
+    const deps = subagentModelDepsOf(ctx);
+    expect(deps.isSessionLive("child-1")).toBe(true);
   });
 
   it("默认保存失败只 warn,不影响切换结果", async () => {
