@@ -83,13 +83,18 @@ export function apply(ctx: Context, _config: Record<string, unknown> = {}): void
   // 位置放在输入框**右下角**的 `conversation.input.right`(提交按钮前的紧凑控件,
   // list 型、会话作用域)—— 与 DSH 原生模型选择器的位置一致,而原生那个 seat 是
   // single 且被硬禁用,subagent 会话里是空的,这里补一个自建的。
+  // order 必须大于 musicpanel 的 `music-composer-cluster`(order 10,同一 right 槽):
+  // right 内按 order 升序排,原生模型槽`conversation.input.model`又在 right 之后,
+  // 子代理里原生模型返回 null,所以「right 槽最后一项」才占据原生模型的位置。
+  // 之前 order 6 < 10 让选择器排在音乐控件前面,比父会话原生模型左移了一整块
+  // 音乐控件宽度;设 11 后顺序变成 音乐 → 本选择器,和父会话视觉对齐。
   ctx.effect(() =>
     ctx.slots.inject("conversation.input.right", () =>
       ctx.slots.register(
         {
           name: "conversation.input.right",
           id: "as-one-subagent-model",
-          order: 6,
+          order: 11,
           locale: LOCALE_NS,
         },
         SubagentModelSelect,
