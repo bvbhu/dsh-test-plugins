@@ -53,6 +53,8 @@ import type {
 import { fpOf, parseDbMembers } from "./utils.js";
 import { invalidateCheckinCache } from "./checkin-cache.js";
 import type { PanelContext } from "./context.js";
+import { quotaHub } from "@as-one/core/src/datahub/index.js";
+import { credentialKey } from "@as-one/core/src/config/credentials.js";
 
 /** 领域产物:面板方法集合。 */
 export interface QoderDomain {
@@ -596,6 +598,26 @@ export function createQoderDomain(ctx: PanelContext): QoderDomain {
             const view = creditsView(region, name, usage);
             out.push(view);
             lastCredits.set(`${region}/${name}`, view);
+            const key = credentialKey(region, name);
+            const nowSec = Math.floor(Date.now() / 1000);
+            quotaHub.set(key, {
+              fetchedAtMs: nowSec * 1000,
+              snapshot: {
+                credentialKey: key,
+                remaining: view.addOnQuota?.remaining ?? null,
+                limit: view.addOnQuota?.total ?? null,
+                // UI 估算的签到积分到期；null/0 = 未知，table() 不写 expires_at。
+                expires_at: view.expiresAt && view.expiresAt > 0 ? view.expiresAt : null,
+                fetched_at: nowSec,
+                packs: [],
+                error: view.error,
+              },
+            });
+            try {
+              ctx.scheduler.invalidate();
+            } catch {
+              /* 缓存失效失败不影响额度快照写入 */
+            }
           } catch (error) {
             out.push(emptyCredits(region, name, errorTextOf(error)));
           }

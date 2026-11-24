@@ -376,8 +376,8 @@ describe("Scheduler.due-first 档位排序", () => {
     expect(plan[0]!.free).toBe(true);
     expect(plan[1]!.free).toBe(false);
     expect(plan[0]!.reason).toBe("T1 免费档(名单第 1 位)");
-    expect(plan[1]!.reason).toContain("T3 消耗档 到期");
-    expect(plan[2]!.reason).toBe("T3 消耗档 到期 2026-11-09 00:00:00");
+    expect(plan[1]!.reason).toContain("T2 赠送额度 到期");
+    expect(plan[2]!.reason).toBe("T2 赠送额度 到期 2026-11-09 00:00:00");
     // 未知到期 → 排本层末
     expect(plan[4]!.reason).toBe("T3 消耗档 到期未知(排本层末)");
     // 到期数值:longcat 10-27 早于 tokenrhythm 11-09
@@ -580,7 +580,7 @@ describe("Scheduler.due-first 档位排序", () => {
     }
   });
 
-  it("T1 < T2 < T3:赠送档插在免费档与消耗档之间(GRANT_TIERS 注入)", () => {
+  it("T1 < T2 < T3:有到期的(含静态 P2)与 GRANT_TIERS 一起进 T2,未知到期排 T2 末", () => {
     const repo = new InMemoryRepo();
     const members: Array<[string, string]> = [
       ["zzz", "no-expiry"],
@@ -600,9 +600,9 @@ describe("Scheduler.due-first 档位排序", () => {
       expect(ids).toEqual([
         "workbuddy/hy4-preview",
         "workbuddy/step-5-preview",
-        "zzz/no-expiry",
         "longcat/LongCat-2.5-Preview",
         "tokenrhythm/glm-5.3-flash",
+        "zzz/no-expiry",
       ]);
     } finally {
       setGrantTiers([]);
@@ -610,10 +610,10 @@ describe("Scheduler.due-first 档位排序", () => {
     expect(GRANT_TIERS).toEqual([]);
   });
 
-  it("运行期配额到期(trae/workbuddy 探针实时值)决定 T3 顺序;撤掉配额 → 回落配置序", () => {
+  it("运行期配额到期(trae/workbuddy 探针实时值)决定 T2 顺序;撤掉配额 → 回落配置序", () => {
     // 基线:无运行期配额。注意 seedDeepseekFlash 不带任何窗口/赠送档规则 ——
     // tokenrhythm 的到期来自**配置** creditExpiry(2026-11-09),trae 在 11-04 有降级窗口,
-    // 那两条都在其它 it 里各自加了规则;这里只看「纯消耗档 + 全部到期并列」的配置序。
+    // 那两条都在其它 it 里各自加了规则;这里只看「全部到期并列 → 配置序」。
     const repo = new InMemoryRepo();
     const members: Array<[string, string]> = [
       ["trae", "deepseek-v4.1-flash"],
@@ -643,7 +643,7 @@ describe("Scheduler.due-first 档位排序", () => {
       "workbuddy/deepseek-v4.1-flash",
       "trae/deepseek-v4.1-flash",
     ]);
-    expect(plan[0]!.reason).toBe("T3 消耗档 到期 2026-11-02 00:00:00");
+    expect(plan[0]!.reason).toBe("T2 赠送额度 到期 2026-11-02 00:00:00");
     // 反过来:trae 更早到期 → trae 先
     repo.setQuota("trae/bvbhu", { expires_at: expiryEpoch("2026-10-30")! });
     sched.invalidate();
@@ -685,6 +685,35 @@ describe("Scheduler.due-first 档位排序", () => {
       "maas/spark-x2.6",
       "opencsg/deepseek-v4.1-flash-1017",
     ]);
+  });
+
+  it("有到期的成员(含运行时快照/P2 静态值)都进 T2,按到期升序混排;未知到期落 T3", () => {
+    // 用户 2026-11-25 口径:所有渠道里带到期时间的成员一律纳入 P2,与 DB 配置
+    // scheduler.rules_p2 里的固定值一起按到期排序。到期不再只影响 T3 内部。
+    const repo = new InMemoryRepo();
+    const members: Array<[string, string]> = [
+      ["unknown", "m"], // 无到期 → T3
+      ["opencsg", "deepseek-v4.1-flash-1017"], // P2 静态 12-01
+      ["codearts", "dynamic-expiry"], // 运行时快照 11-28,不在 GRANT_TIERS
+    ];
+    repo.setLogicalModel("p2-expiry", { strategy: "due-first" });
+    repo.setMembers("p2-expiry", members.map(([p, m]) => ({ provider: p, model: m })));
+    repo.setChain("p2-expiry", members.map(([p, m]) => endpointRow(p, m, SEAT[p] ?? "seat-1")));
+    repo.setSetting("scheduler.rules_p2", JSON.stringify([
+      { provider: "opencsg", model: "deepseek-v4.1-flash-1017", expires_at: "2026-12-01" },
+    ]));
+    repo.setQuota("codearts/seat-1", { expires_at: expiryEpoch("2026-11-28")! });
+    expect(GRANT_TIERS).toEqual([]);
+    const sched = new Scheduler(repo);
+    const plan = sched.planMembers("p2-expiry", { now: at(23, 0) });
+    expect(plan.map((m) => m.realModelId)).toEqual([
+      "codearts/dynamic-expiry", // 11-28 运行时
+      "opencsg/deepseek-v4.1-flash-1017", // 12-01 静态 P2
+      "unknown/m", // 无到期 → T3
+    ]);
+    expect(plan[0]!.reason).toBe("T2 赠送额度 到期 2026-11-28 00:00:00");
+    expect(plan[1]!.reason).toBe("T2 赠送额度 到期 2026-12-01 00:00:00");
+    expect(plan[2]!.reason).toBe("T3 消耗档 到期未知(排本层末)");
   });
 
   it("凭据自身没有到期时,回落 provider 级聚合到期(多账号取最早,用户 m34799)", () => {
@@ -730,7 +759,7 @@ describe("Scheduler.due-first 档位排序", () => {
       sched.chain("wb-vs-trae2", { now: at(23, 0) }).map((c) => c.endpoint.realModelKey),
     ).toEqual(["workbuddy/deepseek-v4.1-flash", "trae/deepseek-v4.1-flash"]);
     const plan = sched.planMembers("wb-vs-trae2", { now: at(23, 0) });
-    expect(plan[0]!.reason).toBe("T3 消耗档 到期 2026-10-30 00:00:00");
+    expect(plan[0]!.reason).toBe("T2 赠送额度 到期 2026-10-30 00:00:00");
   });
 });
 
