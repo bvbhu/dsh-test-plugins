@@ -139,6 +139,11 @@ export interface SubagentSessionInfo {
   isSubagent: boolean;
   mode: "one-shot" | "continuable" | "unknown" | null;
   parentSessionId: string | null;
+  /**
+   * 该会话此刻是否有可写 live Session。`false` ⇒ 子代理休眠,模型切换
+   * 必然不可用(宿主独占其生命周期),UI 应置灰而不是让用户点出失败。
+   */
+  isLive?: boolean;
 }
 
 /** DSH 原生模型目录(经 host sessionController.modelCatalog 中转)。 */
@@ -151,7 +156,15 @@ export function fetchSubagentSessionInfo(sessionId: string): Promise<SubagentSes
   return post<SubagentSessionInfo>("getSubagentSessionInfo", [sessionId]);
 }
 
-/** 切换会话模型(经 host sessionController.selectModel → agent.model.select)。 */
+/**
+ * 切换会话模型。
+ *
+ * ⚠️ 不走 `sessionController.selectModel` —— 它对子代理会话硬拒绝,也拿不到
+ * child scope 的可写 Session。宿主在子代理**运行期间**经 `agent/created`
+ * 暴露 `agent.session`,as-one 缓存它并 `append("model/selection", …)`
+ * (DSH 自己的 `subagent-model-selection-settings` 就是这么写 child 的)。
+ * 子代理休眠时没有任何可写 Session,此时返回 409 `subagent_session_not_live`。
+ */
 export function selectSubagentModel(
   sessionId: string,
   provider: string,
