@@ -16,6 +16,9 @@
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [
+    "DETAILS.en.md",
+    "DETAILS.md",
+    "README.md",
     "lib",
     "client",
     "assets",
