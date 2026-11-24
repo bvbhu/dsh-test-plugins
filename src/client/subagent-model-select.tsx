@@ -182,6 +182,13 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
    * 立即显示目标模型,真正写入 child Session 延迟到下次真实唤醒时 drain。
    */
   const [pending, setPending] = useState<SubagentPendingSelection | null>(null);
+  /**
+   * 本地「刚切过模型」的版本号。读取 pending 的异步请求启动时记下版本,
+   * 回包时若版本已变(用户在请求飞行中切了模型)就丢弃旧值 —— 否则挂载时
+   * 那次 fetch(那时还没 pending)会在切换之后才返回 null,把乐观显示清掉,
+   * 表现就是「切换后输入框又看不到目标模型」。
+   */
+  const pendingWriteSeq = useRef(0);
 
   // 会话切换时重新读取该子代理的 pending 选择。
   useEffect(() => {
@@ -191,11 +198,43 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
       return;
     }
     let cancelled = false;
+    const writeSeqAtStart = pendingWriteSeq.current;
     void fetchSubagentPendingSelection(sid)
-      .then((value) => { if (!cancelled) setPending(value); })
-      .catch(() => { if (!cancelled) setPending(null); });
+      .then((value) => {
+        if (cancelled || pendingWriteSeq.current !== writeSeqAtStart) return;
+        setPending(value);
+      })
+      .catch(() => {
+        if (cancelled || pendingWriteSeq.current !== writeSeqAtStart) return;
+        setPending(null);
+      });
     return () => { cancelled = true; };
   }, [sessionId]);
+
+  /**
+   * 进入子代理页(或切换子代理)就主动拉目录,不等打开菜单。trigger 上的
+   * `model.name` 与思考强度 `name` 都来自目录:不预加载的话 `currentChoice`
+   * 恒为 undefined,只能显示小写 model id(`free`)且思考强度空白,看起来像
+   * 「进页不刷新」。会话切换时 `modelSelection` 投影由宿主推送,这里只负责
+   * 补齐「id → 可读名称」的映射。原生每次 show 也会 reload,故 show() 里
+   * 仍会再拉一次刷新。
+   */
+  const continuable = isContinuable(subagentProjection);
+  useEffect(() => {
+    if (!continuable) return;
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    void fetchModelCatalog()
+      .then((value) => { if (!cancelled) setCatalog(value); })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setCatalog(null);
+        setLoadError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [sessionId, continuable]);
 
   const selected: Selection | null = pending !== null
     ? {
@@ -304,7 +343,10 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
       ? selected?.reasoningEffort
       : effectiveEffort === undefined
         ? "默认"
-        : reasoning.efforts.find((level) => level.id === effectiveEffort)?.name ?? effectiveEffort;
+        : reasoning.efforts.find((level) => level.id === effectiveEffort)?.name
+          // 有些模型的 defaultEffort 是哨兵 id(如 "default"),并不出现在 efforts
+          // 列表里;此时显示成原始 id(小写 "default")很怪,按“默认档”本地化为「默认」。
+          ?? (effectiveEffort === reasoning.defaultEffort ? "默认" : effectiveEffort);
   const effortChoices: EffortChoice[] = reasoning === undefined
     ? []
     : [
@@ -351,6 +393,9 @@ export function SubagentModelSelect({ sessionId, useProjection }: SubagentModelS
       .then(() => {
         // 立即把目标模型设为显示态(等待期间显示):运行态由投影同步,休眠态
         // 由 pending 驱动。乐观写入 pending,避免等待投影/drain 的闪烁。
+        // 先递增版本号,让挂载时在途的 pending fetch 回包作废,否则它会用旧
+        // 的 null 覆盖这里的乐观显示(表现为「切换后输入框又看不到模型」)。
+        pendingWriteSeq.current += 1;
         setPending({
           provider: selection.provider,
           model: selection.model,
