@@ -58,8 +58,13 @@ const CARDS = [
  * ⚠️ 2026-11-08:补回 `workbuddy` —— 它一直有签到能力(工作流签到接口,
  * 见 `@as-one/core` 的 `connectors/checkin.ts` `CHECKIN_PROVIDERS`),隐藏期间
  * 只是不显示。签到是用户显式动作,不会自己触发风控。
+ *
+ * ⚠️ 2026-11-25:补回 `codearts` —— 后端 2026-11-16 已把 B 族 AK/SK 加入
+ * `CHECKIN_PROVIDERS`,首页概览和「全部签到」都显示/执行它;渠道页这里漏配
+ * 导致「首页有 CodeArts 签到、渠道页没有」。qoder 仍保留在 chip 白名单:
+ * 手动签到入口保留,只是自动签到不再触发(见 panel/panel.ts 用户定案)。
  */
-const CHECKIN_PROVIDERS = new Set(["trae", "workbuddy", "minimax", "qoder"]);
+const CHECKIN_PROVIDERS = new Set(["trae", "workbuddy", "minimax", "qoder", "codearts"]);
 
 /** Qoder 的区域键(只接国内版;积分接口按区域取账号池)。 */
 const QODER_REGION = "qoder";
