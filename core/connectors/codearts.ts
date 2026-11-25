@@ -141,6 +141,9 @@ export function codeartsIdentityHeaders(input: CodeartsHeadersInput): Record<str
 export const CODEARTS_CREDENTIAL_CODES = [
   "APIG.0301",
   "APIG.0303",
+  // 2026-11-25 实测：AK 被 IAM 停用（不是删除）时上游回 400 + APIG.0602
+  // "the access key is inactive"——也是凭据类故障，必须计入账号故障。
+  "APIG.0602",
   "STS5.1804",
   "STS5.1806",
   "invalid_grant",

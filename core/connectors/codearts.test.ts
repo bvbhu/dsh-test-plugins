@@ -121,7 +121,7 @@ describe("codeartsErrorOf", () => {
 
 describe("错误分类：换号 / 退避 / 直接回客户端", () => {
   it("凭据类错误码 → auth（即使状态码是 400）", () => {
-    for (const code of ["APIG.0301", "APIG.0303", "STS5.1804", "STS5.1806", "invalid_grant"]) {
+    for (const code of ["APIG.0301", "APIG.0303", "APIG.0602", "STS5.1804", "STS5.1806", "invalid_grant"]) {
       expect(codeartsErrorKind(code, 400)).toBe("auth");
       expect(isCodeartsClientRequestError(code, 400)).toBe(false);
     }
