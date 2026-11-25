@@ -80,6 +80,7 @@ export {
   codeartsIdentityHeaders,
   codeartsSessionId,
   codeartsErrorOf,
+  codeartsProxyRefusalOf,
   statusFromCode,
 } from "./codearts.js";
 export { signCodeartsRequest, buildCanonicalRequest, sdkDateOf } from "./codearts-sign.js";

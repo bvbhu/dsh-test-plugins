@@ -14,6 +14,7 @@ import {
   codeartsErrorKind,
   codeartsErrorOf,
   codeartsIdentityHeaders,
+  codeartsProxyRefusalOf,
   codeartsSessionId,
   isCodeartsClientRequestError,
   requireCodeartsKeys,
@@ -190,5 +191,47 @@ describe("凭据", () => {
     expect(CODEARTS_ADAPTER.classifyError(401, "unauthorized").kind).toBe("auth");
     expect(CODEARTS_ADAPTER.classifyError(502, "bad gateway").kind).toBe("upstream");
     expect(CODEARTS_ADAPTER.classifyError(400, "bad").kind).toBe("bad_request");
+  });
+
+  // 2026-11-25：上下文压缩代理(bili)拒收「签名覆盖 body」的 CodeArts 请求，
+  // 回 403 + {"error":{"type":"signed_request_requires_resign","code":"bili_resign_unavailable"}}。
+  // 旧逻辑把它误报成「AK/SK 鉴权失败」，害得用户白换了一次 AK/SK。
+  it("代理拒收（要求重签）不再误报成 AK/SK 鉴权失败", () => {
+    const body = {
+      error: {
+        type: "signed_request_requires_resign",
+        code: "bili_resign_unavailable",
+        message: "bili refused to forward this sdk-hmac-sha256-signed request",
+      },
+    };
+    const e = CODEARTS_ADAPTER.classifyError(403, body);
+    expect(e.kind).toBe("upstream");
+    expect(e.retryable).toBe(false);
+    expect(e.message).toContain("代理");
+    expect(e.message).toContain("bili_resign_unavailable");
+    expect(e.message.startsWith("CodeArts 请求被上游代理拒收")).toBe(true);
+    // 不再让用户去查/换 AK/SK（旧文案的典型误导）
+    expect(e.message).not.toContain("请检查 accessKey/secretKey");
+    // 上游原文仍随错误返回，便于用户/网关看到代理的真实答复
+    expect(e.raw?.json).toEqual(body);
+  });
+
+  it("codeartsProxyRefusalOf 只认「要求重签」形状", () => {
+    expect(codeartsProxyRefusalOf({ error_code: "APIG.0602", error_msg: "inactive" })).toBeNull();
+    expect(codeartsProxyRefusalOf({ error: { message: "generic" } })).toBeNull();
+    expect(codeartsProxyRefusalOf("plain")).toBeNull();
+    expect(codeartsProxyRefusalOf(null)).toBeNull();
+    const got = codeartsProxyRefusalOf({
+      error: { type: "signed_request_requires_resign", code: "bili_resign_unavailable", message: "m" },
+    });
+    expect(got?.code).toBe("bili_resign_unavailable");
+    expect(got?.message).toBe("m");
+  });
+
+  it("401/403 无业务码时仍归 auth，但提示可能来自中间代理", () => {
+    const e = CODEARTS_ADAPTER.classifyError(403, { error: { message: "forbidden" } });
+    expect(e.kind).toBe("auth");
+    expect(e.message).toContain("AK/SK 鉴权失败");
+    expect(e.message).toContain("中间代理");
   });
 });

@@ -201,6 +201,34 @@ export function codeartsErrorOf(
   return { code, message, status: statusFromCode(code) };
 }
 
+/**
+ * 代理/中间层拒收识别（2026-11-25 实测）。
+ *
+ * DSH 的上下文压缩代理（billion-context / bili）会 MITM 插件的出站请求。它认出
+ * CodeArts APIG 的 **body 级签名**（SDK-HMAC-SHA256）后，若要压缩 body 就必须重签；
+ * 拿不到重签凭据时它**在本地拒收**，回 403，响应体是代理自己的形状：
+ * ```json
+ * {"error":{"type":"signed_request_requires_resign","code":"bili_resign_unavailable","message":"..."}}
+ * ```
+ * 这**不是**华为云的错误形状（没有 `error_code`），旧逻辑会落进「无业务码的 403」→
+ * 误报成「AK/SK 鉴权失败」，用户据此白换了一次 AK/SK（2026-11-25 实际发生过）。
+ */
+export function codeartsProxyRefusalOf(
+  body: unknown,
+): { code: string; message: string } | null {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return null;
+  const rec = body as Record<string, unknown>;
+  const err = rec["error"];
+  if (err === null || typeof err !== "object" || Array.isArray(err)) return null;
+  const e = err as Record<string, unknown>;
+  const code = typeof e["code"] === "string" ? e["code"] : "";
+  const type = typeof e["type"] === "string" ? e["type"] : "";
+  // 只有「要求重签」类拒绝才是代理行为；别的 error 对象照旧按华为云缺失业务码处理。
+  if (!`${code} ${type}`.toLowerCase().includes("resign")) return null;
+  const message = String(e["message"] ?? e["msg"] ?? "上游代理拒收签名请求");
+  return { code: code || type || "proxy_resign_refused", message };
+}
+
 /** 错误码 → 网关错误分类（决定「换号 / 退避 / 直接回客户端」）。 */
 export function codeartsErrorKind(code: string, status: number): UpstreamErrorKind {
   const c = String(code);
@@ -324,6 +352,20 @@ export class CodeartsAdapter {
       const retryable = kind === "rate_limit" || kind === "upstream" || kind === "timeout";
       return new UpstreamError(kind, `CodeArts 上游错误 ${code}: ${biz.message}`, retryable, status, undefined, raw);
     }
+    // 2026-11-25：上下文压缩代理拒收「签名覆盖 body」的请求（拿不到重签凭据）。
+    // 这不是华为云拒绝，凭据多半完全正常 —— 绝不能再报成「AK/SK 鉴权失败」，
+    // 否则用户会白换一次 AK/SK。
+    const refusal = codeartsProxyRefusalOf(body);
+    if (refusal) {
+      return new UpstreamError(
+        "upstream",
+        `CodeArts 请求被上游代理拒收（签名覆盖请求体，代理无法重签）：${refusal.code} ${refusal.message} —— 这不是 AK/SK 鉴权失败，无需更换凭据；请在上下文压缩代理上开启 sdk-hmac-sha256 的 passthrough，或把 codearts 账号注册进宿主凭据服务以便代理重签`,
+        false,
+        httpStatus,
+        undefined,
+        raw,
+      );
+    }
     if (httpStatus >= 200 && httpStatus < 300) {
       // 2xx 且没有业务错误码:调用方不该走到这里(正常响应直接消费)。
       return new UpstreamError("upstream", "CodeArts 上游返回成功", false, httpStatus, undefined, raw);
@@ -334,7 +376,7 @@ export class CodeartsAdapter {
       // 凭据过期。文案如实描述,不再误导用户去"重新登录"。
       return new UpstreamError(
         "auth",
-        `CodeArts AK/SK 鉴权失败（上游 HTTP ${httpStatus}）：请检查 accessKey/secretKey 是否正确、是否被禁用或轮换；若用的是 STS 临时凭据请重新导入（含 securityToken）`,
+        `CodeArts AK/SK 鉴权失败（上游 HTTP ${httpStatus}）：请检查 accessKey/secretKey 是否正确、是否被禁用或轮换；若用的是 STS 临时凭据请重新导入（含 securityToken）。注意：若上游响应体不是华为云的错误格式，也可能是中间代理拒收了这条签名请求 —— 那种情况下凭据本身没问题，换凭据无用`,
         false,
         httpStatus,
         undefined,
