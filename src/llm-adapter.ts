@@ -1030,6 +1030,13 @@ export interface AsOneLlmAdapterOptions {
    */
   reroutes?: () => RerouteSettings;
   /**
+   * 子代理会话的**请求期**并发兜底：返回替代逻辑模型名，`undefined` = 不兜底。
+   *
+   * 只在该请求属于**已创建的子代理会话**时由调用方返回；创建期的并发拦截
+   * （ABORTED）不在这里，保持原语义。兜底只在首帧前 `CAPACITY` 时触发。
+   */
+  subagentFallback?: (sessionId: string | undefined, model: string) => string | undefined;
+  /**
    * 额度预热门（启动后首个请求先刷新到期时间再选路）。
    *
    * ⚠️ **必须注入**（2026-11-16 用户反复报「启动后首个请求仍走 trae」的真根因）：
@@ -1063,6 +1070,7 @@ export class AsOneLlmAdapter implements DshLlmAdapter {
   private readonly providerName: string;
   private readonly resolveAttachments: (() => DshAttachmentService | undefined) | undefined;
   private readonly reroutes: () => RerouteSettings;
+  private readonly subagentFallback: ((sessionId: string | undefined, model: string) => string | undefined) | undefined;
   private readonly warmup: { wait(): Promise<unknown> } | undefined;
 
   constructor(
@@ -1073,6 +1081,7 @@ export class AsOneLlmAdapter implements DshLlmAdapter {
     this.providerName = opts.providerName ?? AS_ONE_PROVIDER_NAME;
     this.resolveAttachments = opts.resolveAttachments;
     this.reroutes = opts.reroutes ?? (() => ({}));
+    this.subagentFallback = opts.subagentFallback;
     this.warmup = opts.warmup;
   }
 
@@ -1519,7 +1528,7 @@ export class AsOneLlmAdapter implements DshLlmAdapter {
     const sessionId = rerouted
       ? `${options.sessionId ?? "anon"}:${String(options.purpose)}`
       : options.sessionId;
-    const request = toUpstreamRequestFromOptions({
+    let request = toUpstreamRequestFromOptions({
       ...options,
       model,
       messages: resolvedMessages,
@@ -1563,18 +1572,51 @@ export class AsOneLlmAdapter implements DshLlmAdapter {
     let seen: DshUsage | undefined;
     let ok = false;
     let failure: AsOneLlmError | undefined;
+    let yieldedAny = false;
+    let triedFallback = false;
     try {
-      for await (const chunk of translateStream(upstream.stream(request), model, options.signal)) {
-        if (firstChunkMs === undefined && chunk.type !== "usage" && chunk.type !== "finish") {
-          firstChunkMs = Date.now() - t0;
+      for (;;) {
+        try {
+          for await (const chunk of translateStream(upstream.stream(request), model, options.signal)) {
+            if (chunk.type !== "usage" && chunk.type !== "finish") yieldedAny = true;
+            if (firstChunkMs === undefined && chunk.type !== "usage" && chunk.type !== "finish") {
+              firstChunkMs = Date.now() - t0;
+            }
+            if (chunk.type === "usage") seen = chunk.usage;
+            yield chunk;
+          }
+          ok = true;
+          break;
+        } catch (err) {
+          const current = err instanceof AsOneLlmError ? err : toLlmError(err, `As One 调用失败(${model})`);
+          // 子代理会话的请求期兜底:只在**首帧前** CAPACITY 时触发,且只试一次。
+          // 只由装配层在 `options.sessionId` 确属已创建子代理会话时返回替代模型;
+          // 创建期拦截(ABORTED)完全不经过这里。
+          if (!yieldedAny && !triedFallback && current.code === CAPACITY_CODE) {
+            const fallback = this.subagentFallback?.(options.sessionId, model);
+            if (fallback !== undefined && fallback !== model) {
+              const fallbackUpstream = this.rt.resolveUpstream(fallback);
+              if (fallbackUpstream !== undefined) {
+                triedFallback = true;
+                model = fallback;
+                upstream = fallbackUpstream;
+                request = toUpstreamRequestFromOptions({
+                  ...options,
+                  model,
+                  messages: resolvedMessages,
+                  provider: this.provider,
+                  sessionId,
+                  tools: rerouted ? undefined : options.tools,
+                });
+                firstChunkMs = undefined;
+                continue;
+              }
+            }
+          }
+          failure = current;
+          throw current;
         }
-        if (chunk.type === "usage") seen = chunk.usage;
-        yield chunk;
       }
-      ok = true;
-    } catch (err) {
-      failure = err instanceof AsOneLlmError ? err : toLlmError(err, `As One 调用失败(${model})`);
-      throw failure;
     } finally {
       // 与 /v1 路由同一口径记一条明细:面板「实时日志」要能看到 DSH 的调用。
       const aborted = options.signal?.aborted === true;

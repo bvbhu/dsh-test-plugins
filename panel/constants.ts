@@ -320,6 +320,22 @@ export const SETTING_FIELDS: SettingFieldSpec[] = [
     kind: "str",
     label: "会话标题",
   },
+  // ── 子代理模型 ────────────────────────────────────────────────────────
+  // 值为 as-one 逻辑模型名（也可直接写 `provider/model`）。
+  // 默认模型只在**创建期**、调用方没显式指定模型时注入；并发拦截语义不变。
+  // 替代模型只在**已创建的子代理会话**请求期遇到首帧前 CAPACITY 时临时使用。
+  {
+    key: "subagent.default_model",
+    def: "",
+    kind: "str",
+    label: "子代理默认模型（留空=跟随父会话）",
+  },
+  {
+    key: "subagent.fallback_model",
+    def: "",
+    kind: "str",
+    label: "子代理并发超限替代模型（留空=不兜底）",
+  },
   // ── 嵌入式组件:压缩增强(src/components/compaction) ───────────────────
   //
   // ⚠️ 2026-11 用户定案:压缩增强**不再是独立卡片**,只保留「压缩模式」一个下拉,

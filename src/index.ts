@@ -35,7 +35,7 @@ import { createExternalUsageCollector, sessionIdOf } from "./usage-external.js";
 import { createWarmupGate, type WarmupGate } from "./warmup-gate.js";
 import { evaluateQuotaFreshness } from "./quota-freshness.js";
 import { createCapacityView } from "./components/capacity.js";
-import { applySubagentLimit } from "./components/subagent-limit.js";
+import { applySubagentLimit, fallbackModelOf } from "./components/subagent-limit.js";
 import { applyCompaction } from "./components/compaction/index.js";
 
 export const name = "@bvbhu/as-one";
@@ -180,9 +180,43 @@ async function startAsOne(ctx: Context): Promise<void> {
   // 容量视图包装 rt.ledger（真实在途账本），组件只按 setting 表的开关/配额裁决，
   // 不做第二套账本、不注册独立 bundle 行。设置默认开启，关掉即不生效。
   const capacity = createCapacityView(runtime.ledger);
+  // 已创建的子代理会话（用于**请求期**并发兜底；创建期拦截不走这里）。
+  // 宿主 `agent/created` 的 `agent.session.header.origin === 'subagent'` 是
+  // DSH 0.2.2 的会话来源判定（与 as-one 既有 selector 判定同源）。
+  const subagentSessions = new Set<string>();
+  const sessionEvents = ctx as unknown as {
+    on(event: string, listener: (payload: { agent?: { id?: string; session?: { id?: string; header?: { origin?: string } } } }) => void): void;
+  };
+  const childSessionIdOf = (agent: { id?: string; session?: { id?: string } } | undefined) =>
+    agent?.id ?? agent?.session?.id;
+  sessionEvents.on("agent/created", ({ agent }) => {
+    const id = childSessionIdOf(agent);
+    if (id !== undefined && agent?.session?.header?.origin === "subagent") subagentSessions.add(id);
+  });
+  sessionEvents.on("agent/disposed", ({ agent }) => {
+    const id = childSessionIdOf(agent);
+    if (id !== undefined) subagentSessions.delete(id);
+  });
+  const resolveLogicalModel = (name: string): { provider: string; model: string } | null => {
+    const slash = name.indexOf("/");
+    if (slash > 0) {
+      const provider = name.slice(0, slash);
+      const model = name.slice(slash + 1);
+      return provider !== "" && model !== "" ? { provider, model } : null;
+    }
+    try {
+      const first = runtime.scheduler.chain(name)[0];
+      return first ? { provider: first.endpoint.provider, model: first.endpoint.model } : null;
+    } catch {
+      return null;
+    }
+  };
   // 子代理并发限制 = 模型自身的并发容量（启用凭据数 × 每凭据并发；逻辑模型取成员之和）。
   // 2026-11 用户定案：不再有任何 subagentLimit.* 设置项。
-  const disposeSubagentLimit = applySubagentLimit(ctx, capacity, runtime.subagentCapOf);
+  const disposeSubagentLimit = applySubagentLimit(ctx, capacity, runtime.subagentCapOf, {
+    getSetting: runtime.getSetting,
+    resolveLogical: resolveLogicalModel,
+  });
   // 压缩拦截器要挂在有 `llm` 服务的子 fiber 上（下面 llm effect 里装配），
   // 这里先留 disposer 槽位。
   let disposeCompaction: (() => void) | undefined;
@@ -318,6 +352,12 @@ async function startAsOne(ctx: Context): Promise<void> {
         // 服务缺失时 adapter 如实降级(丢图片块),文本请求照常。
         // 现读 setting 表:面板保存后下一个请求就换车道。
         reroutes: () => rerouteSettingsFrom(runtime.getSetting),
+        // 只对**已创建的子代理会话**返回替代模型；创建期并发拦截不在此路径。
+        subagentFallback: (sessionId, model) => {
+          if (sessionId === undefined || !subagentSessions.has(sessionId)) return undefined;
+          const fallback = fallbackModelOf(runtime.getSetting);
+          return fallback === model ? undefined : fallback;
+        },
         resolveAttachments: () => {
           try {
             return (child.get("attachments") as DshAttachmentService | undefined) ?? undefined;
