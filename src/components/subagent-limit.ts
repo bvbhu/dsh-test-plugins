@@ -51,7 +51,57 @@ export type SubagentCapOf = (
 export interface ResolvedModel {
   provider: string | undefined;
   model: string | undefined;
-  source: "arguments" | "agent.model" | "fallback";
+  source: "arguments" | "agent.model" | "default" | "fallback";
+}
+
+/** 逻辑模型名 → 一个具体运行成员（由装配层用 scheduler.chain 解析）。 */
+export type ResolveLogicalModel = (name: string) => { provider: string; model: string } | null;
+
+export interface SubagentRouteOptions {
+  /** 面板设置现读口（`subagent.default_model` 等）。 */
+  getSetting?: (key: string) => string | null;
+  /** 逻辑模型名 → 具体 provider/model。 */
+  resolveLogical?: ResolveLogicalModel;
+}
+
+function modelNameOf(exec: { arguments?: unknown }): string | undefined {
+  const args = exec?.arguments as Record<string, unknown> | undefined;
+  return args && typeof args.model === "string" && args.model !== "" ? args.model : undefined;
+}
+
+/**
+ * 未显式指定模型时，用设置里的子代理默认模型。
+ *
+ * 返回值是**注入后的**目标；无法解析（没配 / 逻辑模型没有成员）时原样返回。
+ * 只在创建期生效；创建期的并发拦截（ABORTED）仍然照旧。
+ */
+export function applyDefaultModel(
+  exec: { arguments?: unknown },
+  opts: SubagentRouteOptions,
+): ResolvedModel | null {
+  const explicit = modelNameOf(exec);
+  if (explicit !== undefined) return null;
+  const raw = opts.getSetting?.("subagent.default_model")?.trim() ?? "";
+  if (raw === "") return null;
+  const ref = raw.includes("/")
+    ? (() => {
+        const [provider, ...rest] = raw.split("/");
+        const model = rest.join("/");
+        return provider && model ? { provider, model } : null;
+      })()
+    : (opts.resolveLogical?.(raw) ?? null);
+  if (ref === null) return null;
+  const args = (exec.arguments as Record<string, unknown> | undefined) ?? {};
+  args.provider = ref.provider;
+  args.model = ref.model;
+  exec.arguments = args;
+  return { provider: ref.provider, model: ref.model, source: "default" };
+}
+
+/** 请求期兜底：设置在 `subagent.fallback_model` 的逻辑模型名。 */
+export function fallbackModelOf(getSetting?: (key: string) => string | null): string | undefined {
+  const raw = getSetting?.("subagent.fallback_model")?.trim() ?? "";
+  return raw === "" ? undefined : raw;
 }
 
 /** 解析这次 subagent 调用落在哪个模型上。 */
@@ -117,6 +167,7 @@ export function applySubagentLimit(
   ctx: Context,
   capacity: CapacityView,
   capOf: SubagentCapOf,
+  routeOptions: SubagentRouteOptions = {},
 ): () => void {
   const toolNames = new Set(DEFAULT_TOOL_NAMES);
   /** 把本次调用的预留句柄传给 subagent/start（异步上下文）。 */
@@ -138,7 +189,10 @@ export function applySubagentLimit(
     };
     if (!e.name || !toolNames.has(e.name)) return next();
 
-    const resolved = resolveModel(e);
+    // 子代理默认模型:只在**创建期、且调用方没有显式指定模型**时注入。
+    // 创建期的容量拦截语义不变(见下方 ABORTED)。
+    const injected = applyDefaultModel(e, routeOptions);
+    const resolved = injected ?? resolveModel(e);
     // 限制 = 该模型的总并发容量(启用凭据数 × 每凭据并发;逻辑模型取成员之和)。
     // 查不到容量 → 不拦截(没有并发信息就不该凭猜测拦人)。
     const limit = capOf(resolved.provider, resolved.model);

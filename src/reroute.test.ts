@@ -17,7 +17,7 @@ import type {
   UpstreamRequest,
 } from "@as-one/core/src/gateway/types.js";
 import type { AsOneRuntime } from "../src/setup.js";
-import { AsOneLlmAdapter } from "../src/llm-adapter.js";
+import { AsOneLlmAdapter, AsOneLlmError, CAPACITY_CODE } from "../src/llm-adapter.js";
 import {
   normalizeReroutes,
   rerouteCount,
@@ -244,5 +244,68 @@ describe("AsOneLlmAdapter 重路由", () => {
     expect(req?.extra?.session_id).toBe("s1");
     expect(req?.tools?.length).toBe(1);
     expect(captured.complete).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 子代理请求期并发兜底（2026-11-25 用户定案）
+//
+// 只在**已创建的子代理会话**里生效；创建期的并发拦截（ABORTED）不在这里，
+// 语义不变。触发条件是「首帧前 CAPACITY」，且只换一次模型。
+// ---------------------------------------------------------------------------
+
+describe("AsOneLlmAdapter 子代理并发兜底", () => {
+  function fallbackFixture() {
+    const captured: Captured = { stream: [], complete: [] };
+    const normal = fakeUpstream(captured);
+    const busy: Upstream = {
+      stream(req) {
+        captured.stream.push(req);
+        return (async function* () {
+          throw new AsOneLlmError("模型并发已满", CAPACITY_CODE, { status: 503 });
+        })();
+      },
+      complete: async () => {
+        throw new Error("unused");
+      },
+    };
+    const rt = {
+      listModels: async () => [],
+      resolveUpstream: (model: string) => (model === "auto" ? busy : model === "free" ? normal : undefined),
+      onRequestDone: () => {},
+    } as unknown as AsOneRuntime;
+    return { captured, rt };
+  }
+
+  it("首帧前 CAPACITY → 切替代模型重试一次", async () => {
+    const { captured, rt } = fallbackFixture();
+    const adapter = new AsOneLlmAdapter(rt, {
+      subagentFallback: (sessionId, model) =>
+        sessionId === "child-1" && model === "auto" ? "free" : undefined,
+    });
+    const chunks = await drain(adapter.stream({ ...options(), sessionId: "child-1" }));
+    // 第一次 auto 被拒，第二次换 free 成功
+    expect(captured.stream.map((req) => req.model)).toEqual(["auto", "free"]);
+    expect(chunks.some((chunk) => chunk.type === "text-delta")).toBe(true);
+  });
+
+  it("非子代理会话 → 不兜底，原 CAPACITY 错误抛出", async () => {
+    const { captured, rt } = fallbackFixture();
+    const adapter = new AsOneLlmAdapter(rt, {
+      subagentFallback: (sessionId) => (sessionId === "child-1" ? "free" : undefined),
+    });
+    await expect(drain(adapter.stream({ ...options(), sessionId: "parent-1" }))).rejects.toMatchObject({
+      code: CAPACITY_CODE,
+    });
+    expect(captured.stream).toHaveLength(1);
+  });
+
+  it("回调不给替代模型 → 不重试", async () => {
+    const { captured, rt } = fallbackFixture();
+    const adapter = new AsOneLlmAdapter(rt, { subagentFallback: () => undefined });
+    await expect(drain(adapter.stream({ ...options(), sessionId: "child-1" }))).rejects.toMatchObject({
+      code: CAPACITY_CODE,
+    });
+    expect(captured.stream).toHaveLength(1);
   });
 });

@@ -7,7 +7,12 @@
  * 容量由 `SubagentCapOf` 回调给出。这里覆盖模型解析与错误构造。
  */
 import { describe, it, expect } from "vitest";
-import { resolveModel, limitError } from "./subagent-limit.js";
+import {
+  applyDefaultModel,
+  fallbackModelOf,
+  limitError,
+  resolveModel,
+} from "./subagent-limit.js";
 
 function execWith(args: unknown, parent?: unknown) {
   return {
@@ -45,6 +50,45 @@ describe("resolveModel", () => {
       },
     });
     expect(r.source).toBe("fallback");
+  });
+});
+
+describe("applyDefaultModel", () => {
+  const settings = (table: Record<string, string>) => (key: string) => table[key] ?? null;
+  const resolveLogical = (name: string) =>
+    name === "deepseek-flash" ? { provider: "trae", model: "deepseek-v4.1-flash" } : null;
+
+  it("调用方显式指定模型时绝不覆盖", () => {
+    const exec = execWith({ provider: "as-one", model: "auto" });
+    expect(applyDefaultModel(exec, { getSetting: settings({ "subagent.default_model": "deepseek-flash" }), resolveLogical })).toBeNull();
+    expect((exec.arguments as { model?: string }).model).toBe("auto");
+  });
+
+  it("没有显式模型时注入逻辑模型解析出的真实模型", () => {
+    const exec = execWith({});
+    const r = applyDefaultModel(exec, { getSetting: settings({ "subagent.default_model": "deepseek-flash" }), resolveLogical });
+    expect(r).toEqual({ provider: "trae", model: "deepseek-v4.1-flash", source: "default" });
+    expect(exec.arguments).toMatchObject({ provider: "trae", model: "deepseek-v4.1-flash" });
+  });
+
+  it("逻辑模型没有成员时保持原样", () => {
+    const exec = execWith({});
+    expect(applyDefaultModel(exec, { getSetting: settings({ "subagent.default_model": "missing" }), resolveLogical })).toBeNull();
+    expect(exec.arguments).toEqual({});
+  });
+
+  it("直接写 provider/model 时不再走逻辑解析", () => {
+    const exec = execWith({});
+    const r = applyDefaultModel(exec, { getSetting: settings({ "subagent.default_model": "opencsg/deepseek-v4.1-flash-1017" }) });
+    expect(r).toEqual({ provider: "opencsg", model: "deepseek-v4.1-flash-1017", source: "default" });
+  });
+});
+
+describe("fallbackModelOf", () => {
+  it("读 subagent.fallback_model，空值不兜底", () => {
+    expect(fallbackModelOf((k) => (k === "subagent.fallback_model" ? "free" : null))).toBe("free");
+    expect(fallbackModelOf((k) => (k === "subagent.fallback_model" ? "  " : null))).toBeUndefined();
+    expect(fallbackModelOf(undefined)).toBeUndefined();
   });
 });
 
