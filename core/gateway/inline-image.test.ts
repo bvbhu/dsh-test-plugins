@@ -31,6 +31,10 @@ import {
 /** 造一个可控长度的 base64(不真解码,只测形状)。 */
 const b64 = (n: number): string => "A".repeat(n);
 
+/** 合法 1×1 PNG（normalize 路径要求真实图片，2026-11-26 起）。 */
+const PNG_1PX =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
 describe("splitInlineImageDataUrls", () => {
   it("把 3.7MB 内联图切成 [text, image_url, text]", () => {
     const parts = splitInlineImageDataUrls(`按这张图标注:data:image/png;base64,${b64(3_700_000)} 完成后回复`);
@@ -89,7 +93,7 @@ describe("splitInlineImageDataUrls", () => {
 describe("normalizeInlineImages", () => {
   it("字符串内联图 → 块数组,且 imagePartIndices 能数出来", () => {
     const before: BridgeMessage[] = [
-      { role: "user", content: `图:data:image/png;base64,${b64(1000)}` },
+      { role: "user", content: `图:data:image/png;base64,${PNG_1PX}` },
     ];
     // 修复前:认不出(这是 bug 的核心)
     expect(imagePartIndices(before)).toHaveLength(0);
@@ -117,16 +121,33 @@ describe("normalizeInlineImages", () => {
   });
 
   it("多张内联图超过上限 → dropExcessImages 能正常丢弃", () => {
-    // ⚠️ 每张用 128 字符 payload(过 64 门槛):真实内联图至少几百字节,
-    // 用 4 个字符的 "AAAA" 造数据会被门槛当成「不是图」,测出来的是假象。
+    // ⚠️ 用**真实**的 1×1 PNG:2026-11-26 起 normalize 只认结构完整的图片，
+    // 用 "A" 重复出来的假 base64 会被当成文本（那正是 sensenova 坏图的修法）。
     const many: BridgeMessage[] = Array.from({ length: 25 }, (_, i) => ({
       role: "user",
-      content: `图${i}:data:image/png;base64,${b64(128)}`,
+      content: `图${i}:data:image/png;base64,${PNG_1PX}`,
     }));
     const normalized = normalizeInlineImages(many);
     expect(imagePartIndices(normalized)).toHaveLength(25);
     const [trimmed, dropped] = dropExcessImages(normalized);
     expect(dropped).toBe(25 - IMAGE_MAX_PASSTHROUGH);
     expect(imagePartIndices(trimmed)).toHaveLength(IMAGE_MAX_PASSTHROUGH);
+  });
+
+  it("工具输出里的 data URL 字面量不当图（2026-11-26 sensenova 坏图回归）", () => {
+    // 生产故障：读源码的工具结果里含 `ICON="data:image/png;base64,<截断>"`。
+    // 工具消息原样保留，绝不切出图片块。
+    const tool: BridgeMessage[] = [
+      { role: "tool", content: `DEVICE_LIMIT_NOTICE_ICON="data:image/png;base64,${PNG_1PX}"` },
+    ];
+    expect(normalizeInlineImages(tool)).toBe(tool);
+    expect(imagePartIndices(tool)).toHaveLength(0);
+  });
+
+  it("用户消息里的截断 base64 保持文本（不发坏图）", () => {
+    const truncated = PNG_1PX.slice(0, PNG_1PX.length - 3); // 长度不再是 4 的倍数
+    const msg: BridgeMessage[] = [{ role: "user", content: `图:data:image/png;base64,${truncated}` }];
+    expect(normalizeInlineImages(msg)).toBe(msg);
+    expect(imagePartIndices(msg)).toHaveLength(0);
   });
 });

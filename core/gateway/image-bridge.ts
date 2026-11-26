@@ -292,6 +292,76 @@ export type BridgeMessage = {
 const MIN_INLINE_BASE64_LEN = 64;
 
 /**
+ * payload 是不是**结构完整**的图片 base64（2026-11-26，用户报 sensenova
+ * `invalid image base64 content`）。
+ *
+ * ## 为什么需要
+ *
+ * 生产故障：一个**工具输出**（读到的 JS 源码）里含
+ * `DEVICE_LIMIT_NOTICE_ICON="data:image/png;base64,<687 字符>"`，而这段工具输出
+ * 本身被截断了 → payload 不是 4 的倍数、解码出来是半个 PNG。旧逻辑只看
+ * 「≥64 字符」，于是把它当成图，发给了 sensenova；sensenova 校验解码后的图片
+ * 字节，回 `{"code":"3","message":"invalid image base64 content"}`。
+ *
+ * 所以这里做三层校验：
+ * 1. base64 编码本身合法（长度 4 的倍数 + 重新编码逐字一致）；
+ * 2. 解出来的字节确实是图片（按 mime 校验魔数与**尾部标记**，截断图会被挡下）；
+ * 3. 至少 32 字节（比 64 字符门槛更严一点点，代价可忽略）。
+ *
+ * 只对**用户消息里的内联字符串**启用（见 {@link normalizeInlineImages}）；
+ * 工具输出/源码里的 `data:image/...` 字面量一律不当图。
+ */
+function isCompleteBase64Image(payload: string, header: string): boolean {
+  if (payload.length === 0 || payload.length % 4 !== 0) return false;
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(payload, "base64");
+  } catch {
+    return false;
+  }
+  if (bytes.length < 32) return false;
+  // `Buffer.from` 会静默丢弃非法字符，所以必须重新编码比对。
+  if (bytes.toString("base64").replace(/=+$/, "") !== payload.replace(/=+$/, "")) return false;
+  const mime = /^data:image\/([a-z0-9.+-]+)/i.exec(header)?.[1]?.toLowerCase() ?? "";
+  const ascii = (start: number, end: number): string => bytes.subarray(start, end).toString("ascii");
+  const startsWithBytes = (...arr: number[]): boolean => arr.every((v, i) => bytes[i] === v);
+  if (mime === "png" || mime === "apng") {
+    return startsWithBytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a) && bytes.includes(Buffer.from("IEND", "ascii"));
+  }
+  if (mime === "jpeg" || mime === "jpg") {
+    return startsWithBytes(0xff, 0xd8) && bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9;
+  }
+  if (mime === "gif") {
+    return ascii(0, 4) === "GIF8" && bytes[bytes.length - 1] === 0x3b;
+  }
+  if (mime === "webp") {
+    return ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP";
+  }
+  if (mime === "bmp") {
+    return ascii(0, 2) === "BM";
+  }
+  if (mime === "svg+xml") {
+    return bytes.toString("utf8").includes("</svg>");
+  }
+  // 未知 mime：至少要有常见图片魔数（宁缺勿滥，宁可当文本也不发坏图）。
+  return (
+    startsWithBytes(0x89, 0x50, 0x4e, 0x47) ||
+    startsWithBytes(0xff, 0xd8, 0xff) ||
+    ascii(0, 4) === "GIF8" ||
+    ascii(8, 12) === "WEBP"
+  );
+}
+
+/** {@link splitInlineImageDataUrls} 的可选行为。 */
+export interface SplitInlineImageOptions {
+  /**
+   * 只接受 {@link isCompleteBase64Image} 认定的完整图片（默认 `false`，保留旧的
+   * 形状级行为）。生产路径由 {@link normalizeInlineImages} 打开。
+   */
+  requireComplete?: boolean;
+}
+
+/**
  * 一条 content **字符串**里的内联 data URL(2026-11-09,用户报「网关扔图」)。
  *
  * ## 为什么需要它
@@ -316,7 +386,10 @@ const MIN_INLINE_BASE64_LEN = 64;
  *
  * @returns 该消息的块数组;字符串里没有 data URL 时返回 `null`(调用方保持原样)。
  */
-export function splitInlineImageDataUrls(content: string): ContentPart[] | null {
+export function splitInlineImageDataUrls(
+  content: string,
+  opts: SplitInlineImageOptions = {},
+): ContentPart[] | null {
   // `data:image/<subtype>[;param...];base64,<payload>`
   //
   // ⚠️ 分两段匹配,不用「贪婪 + 负向前瞻」:
@@ -351,6 +424,10 @@ export function splitInlineImageDataUrls(content: string): ContentPart[] | null 
     // 不足就认为不是图,跳过这个头(继续找下一个)。
     const payloadLen = end - (m.index + m[0].length);
     if (payloadLen < MIN_INLINE_BASE64_LEN) {
+      continue;
+    }
+    // 结构校验（生产路径开启）：截断/伪造的 base64 一律当文本，绝不发给上游。
+    if (opts.requireComplete === true && !isCompleteBase64Image(content.slice(m.index + m[0].length, end), m[0])) {
       continue;
     }
     hit = true;
@@ -483,17 +560,24 @@ export function shouldBridgeImages(chainHasVision: boolean): boolean {
 /**
  * 把**字符串形态的内联图**规范化成标准块数组(纯函数,不改入参)。
  *
- * 只处理「content 是字符串且含 data:image」的消息;块数组原样保留
+ * 只处理**用户消息**里 content 是字符串且含 data:image 的消息；块数组原样保留
  * (已经标准了,再切一遍反而可能把文本块拆碎)。
+ *
+ * ⚠️ 2026-11-26：只认 `role === "user"`，并且要求 payload 是**完整图片**
+ * （{@link isCompleteBase64Image}）。生产故障就是「工具输出里的源码片段含一个
+ * 被截断的 `data:image/png;base64,…`」，旧逻辑把它当图发给 sensenova，回
+ * `invalid image base64 content`。工具/助手/系统消息里的 data URL 字面量一律
+ * 保持文本原样。
  *
  * 调用点在 `bridgeImagesIfNeeded` **之前**:先规范化,后面所有环节就都按块处理了。
  */
 export function normalizeInlineImages(messages: BridgeMessage[]): BridgeMessage[] {
   let changed = false;
   const out = messages.map((msg) => {
+    if (msg?.role !== "user") return msg;
     const content = msg?.content;
     if (typeof content !== "string" || !content.includes("data:image")) return msg;
-    const parts = splitInlineImageDataUrls(content);
+    const parts = splitInlineImageDataUrls(content, { requireComplete: true });
     if (parts === null) return msg;
     changed = true;
     return { ...msg, content: parts };
