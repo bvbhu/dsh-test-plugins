@@ -473,6 +473,31 @@ export function mentionsContextOverflow(detail: string): boolean {
 }
 
 /**
+ * 明确**不是**「装不下」的错误文案（2026-11-26，sensenova 图片误判）。
+ *
+ * 生产故障：sensenova 对坏图回 `{"code":"3","message":"invalid image base64
+ * content"}`，kind=`bad_request`；因为请求本身 >128k token，旧 `isContextOverflow`
+ * 的第二档启发式把它判成「上下文超窗」，于是不走换档、直接把错误包装成
+ * 「请求超出模型上下文窗口」，还被 DSH 包成 `MODEL_SWITCH_COMPACTION_FAILED`。
+ *
+ * 这里先做**明确否决**：只要文案点名图片/附件类格式错误，就不可能是上下文超窗。
+ */
+const NON_OVERFLOW_PATTERNS: readonly RegExp[] = [
+  /invalid\s+image\s+base64/i,
+  /image\s+download\s+failed/i,
+  /invalid\s+image(?:\s+format|\s+content|\s+data)?/i,
+  /unsupported\s+image/i,
+  /image\s+(?:too\s+large|not\s+supported)/i,
+  /(?:invalid|malformed)\s+attachment/i,
+];
+
+/** 文案是否明确指向「图片/附件格式问题」（这类错误永远不是上下文超窗）。 */
+export function mentionsNonOverflowFailure(detail: string): boolean {
+  const text = detail ?? "";
+  return NON_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
  * 这次失败是不是「装不下」。
  *
  * 三档判据:
@@ -480,6 +505,9 @@ export function mentionsContextOverflow(detail: string): boolean {
  * 2. 文案没点名,但是 400/422 且请求本身 ≥12.8 万 token(如 sensenova 的裸
  *    `code: 3`)→ 认为大概率是(代价分析见 {@link GENERIC_OVERFLOW_MIN_TOKENS});
  * 3. 其余 → 不是。
+ *
+ * ⚠️ 2026-11-26：先看 {@link mentionsNonOverflowFailure} —— 图片/附件格式错误
+ * 即使 token 很大也不是「装不下」，不能被第 2 档启发式吞掉。
  *
  * @param detail          上游原文(`gerr.detail`)。
  * @param kind            归一后的错误族(`gerr.kind`)。
@@ -490,6 +518,7 @@ export function isContextOverflow(
   kind: string,
   estimatedTokens: number,
 ): boolean {
+  if (mentionsNonOverflowFailure(detail)) return false;
   if (mentionsContextOverflow(detail)) return true;
   const badRequest = kind === "bad_request" || kind === "invalid_request";
   return badRequest && estimatedTokens >= GENERIC_OVERFLOW_MIN_TOKENS;
