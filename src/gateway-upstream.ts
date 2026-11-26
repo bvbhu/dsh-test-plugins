@@ -374,10 +374,16 @@ import { iterUpstreamChunks } from "./gateway-upstream-stream.js";
 import {
   MAX_CONTEXT_SHRINKS,
   counterForModel,
+  describeMaskedOverflow,
+  effectiveWindowTokens,
+  estimateRequestTokens,
   fitForEndpoint,
   isContextOverflow,
+  isMaskedOverflow,
   isRateLimitOversize,
   noteContextOverflow,
+  notePromptUsage,
+  promptScale,
 } from "./gateway-upstream-context.js";
 
 /**
@@ -717,6 +723,10 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
         let contextCapHint: number | null = null;
         // 本轮**真正发出去**的 prompt 量值(裁剪后),溢出判据要用它。
         let sentPromptTokens = 0;
+        // 未校准的原始估算(校准比例用它算,免得越校越偏)。
+        let rawPromptTokens = 0;
+        // 「上游把装不下说成调用失败」时的诚实提示(2026-11-26);null = 没触发。
+        let maskedOverflowNotice: string | null = null;
         // ⚠️ **reasoning_effort 被上游拒过一次就丢掉**(用户 m09081:「只原样透传,
         // 上游报相关错误则丢弃」)。置位后本轮及后续尝试都不带这个字段 —— 网关
         // 不解释档位值,上游说不支持就绕开,而不是把 400 交回客户端。
@@ -844,7 +854,19 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
               contextCapHint,
               measured,
             );
-            sentPromptTokens = fitted.estimatedAfter;
+            // ⚠️ **量的必须是「真正发出去的东西」**(2026-11-26):
+            //   ① 工具定义(`tools`)上游**也**计入 prompt_tokens —— 实测
+            //      tokenrhythm/egg-alpha-003:10 个 5K 字符的工具定义 = +36,966
+            //      tokens。漏算它 = 系统性低估好几万 token = 把必然失败的请求
+            //      发出去;
+            //   ② 乘上「按上游 usage 校准过的比例」—— 我们系统性低估约 9%
+            //      (实测中文 0.826 tok/字 vs 我们算的 0.75)。
+            sentPromptTokens = Math.ceil(
+              estimateRequestTokens(fitted.messages, bodyReq.tools, measured.count) *
+                promptScale(item.endpoint.endpointId),
+            );
+            // 未校准的原始估算(校准时用这个:拿「真值 ÷ 原始猜测」当比例)。
+            rawPromptTokens = estimateRequestTokens(fitted.messages, bodyReq.tools, measured.count);
             if (fitted.changed) {
               console.warn(
                 `[as-one] context trim model=${model} endpoint=${item.endpoint.endpointId} ` +
@@ -934,6 +956,11 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
             yield chunk;
           }
 
+          // 🧮 **按上游口径校准估算**(2026-11-26):上游回显的 prompt_tokens 是
+          // 真值,我们估的是猜的值 —— 拿真的去修猜的,下次就能少低估。
+          if (usage?.prompt_tokens) {
+            notePromptUsage(item.endpoint.endpointId, rawPromptTokens, usage.prompt_tokens);
+          }
           // sensenova 账号池:补记本次可计费 token(SSE 尾块 usage)。
           if (snRuntime) {
             snConnector?.recordSpendFor(snRuntime.name, usage, ttftMs === null ? 0 : Math.round(ttftMs));
@@ -1051,7 +1078,26 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
             //    (链上只有 1 个成员 → maxAttempts=1)连一次重发都做不了;
             // ③ 每轮把量出来的长度砍半(1 → 1/2 → 1/4 → 1/8),`MAX_CONTEXT_SHRINKS` 封顶,
             //    收敛出的长度顺手写进 `observedCeilings`,后续请求发之前就裁到位。
-            const overflow = !firstChunkEmitted && isContextOverflow(gerr.detail, gerr.kind, sentPromptTokens);
+            // 🪟 端点**实际**输入窗口(声明值与实测值取小):识别「伪装超限」要用它。
+            const windowTokens = effectiveWindowTokens(
+              item.endpoint.maxInputTokens,
+              item.endpoint.endpointId,
+            );
+            // 🪟 **上游把「装不下」说成「调用失败」**(2026-11-26 tokenrhythm/
+            // egg-alpha-003 实测):越线时上游不回 context_length_exceeded,而回
+            // 「模型调用失败,请提供 traceId 联系管理员核查」—— 用户看到只
+            // 会去联系厂商,永远不知道自己该 /compact。判据见 isMaskedOverflow:
+            // 话术像 **且** 请求确实贴着窗口(小请求上的同款文案是上游故障,
+            // 那种该换档,不能算超窗)。
+            const maskedOverflow =
+              !firstChunkEmitted &&
+              isMaskedOverflow(gerr.detail, gerr.kind, sentPromptTokens, windowTokens);
+            if (maskedOverflow) {
+              maskedOverflowNotice = describeMaskedOverflow(sentPromptTokens, windowTokens);
+            }
+            const overflow =
+              !firstChunkEmitted &&
+              isContextOverflow(gerr.detail, gerr.kind, sentPromptTokens, windowTokens);
             // 🛡️ **11128 渠道校验拦截不罚账号**(2026-11-08,A3)。
             // 调研结论(`TROUBLESHOOTING-11-128.md`):11128 是**请求内容 / 客户端身份**
             // 没过渠道校验,不是账号健康问题 —— 换号换 Key 都不改变结果。给它记一次
@@ -1162,6 +1208,17 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
             console.warn(`[as-one] stream cut after first chunk (${model}): ${gerr.detail}`);
             return;
           }
+          // 🧯 **上游把「装不下」说成「调用失败」**(2026-11-26 tokenrhythm/
+          // egg-alpha-003 实测):上游越线时不回 context_length_exceeded,而回
+          // 「模型调用失败,请提供 traceId 联系管理员核查」—— 那条措辞会把人
+          // 送去联系厂商,而真相是「你这请求太长」。这里换成说实话的版本。
+          if (maskedOverflowNotice !== null) {
+            throw new UpstreamError(
+              UpstreamErrorKind.BadRequest,
+              maskedOverflowNotice,
+              { statusCode: httpStatusOf(gerr) },
+            );
+          }
           // 🧯 上下文超窗压到底仍被拒:换哪个成员都一样装不下,不再换档浪费一轮
           // 大请求;把「装不下 + 已经压过几次」说清楚,让用户知道该 /compact 或
           // 新建会话,而不是对着上游的裸 `code: 3` 猜。
@@ -1252,6 +1309,10 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
         let contextShrinks = 0;
         let contextCapHint: number | null = null;
         let sentPromptTokens = 0;
+        // 未校准的原始估算(校准比例用它算,免得越校越偏)。
+        let rawPromptTokens = 0;
+        // 「上游把装不下说成调用失败」时的诚实提示(2026-11-26);null = 没触发。
+        let maskedOverflowNotice: string | null = null;
         // ⚠️ **reasoning_effort 被上游拒过一次就丢掉**(用户 m09081):同 stream() 口径。
         let stripReasoningEffort = false;
         // ⏱️ TTFT 起点(同 stream()):客户端请求进网关的时刻,不随每档重开 ——
@@ -1355,7 +1416,19 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
               contextCapHint,
               measured,
             );
-            sentPromptTokens = fitted.estimatedAfter;
+            // ⚠️ **量的必须是「真正发出去的东西」**(2026-11-26):
+            //   ① 工具定义(`tools`)上游**也**计入 prompt_tokens —— 实测
+            //      tokenrhythm/egg-alpha-003:10 个 5K 字符的工具定义 = +36,966
+            //      tokens。漏算它 = 系统性低估好几万 token = 把必然失败的请求
+            //      发出去;
+            //   ② 乘上「按上游 usage 校准过的比例」—— 我们系统性低估约 9%
+            //      (实测中文 0.826 tok/字 vs 我们算的 0.75)。
+            sentPromptTokens = Math.ceil(
+              estimateRequestTokens(fitted.messages, bodyReq.tools, measured.count) *
+                promptScale(item.endpoint.endpointId),
+            );
+            // 未校准的原始估算(校准时用这个:拿「真值 ÷ 原始猜测」当比例)。
+            rawPromptTokens = estimateRequestTokens(fitted.messages, bodyReq.tools, measured.count);
             if (fitted.changed) {
               console.warn(
                 `[as-one] context trim model=${model} endpoint=${item.endpoint.endpointId} ` +
@@ -1430,6 +1503,10 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
               const chunks = iterUpstreamChunks(res.body!, wireProtocolOf(protocol), { completionId, created, model: req.model }, item.endpoint.provider);
               data = await aggregateCompletion(chunks, { model: req.model, completionId, created });
             }
+            // 🧮 **按上游口径校准估算**(2026-11-26):同 stream() 口径。
+            if (data.usage?.prompt_tokens) {
+              notePromptUsage(item.endpoint.endpointId, rawPromptTokens, data.usage.prompt_tokens);
+            }
             // sensenova 账号池:补记本次可计费 token(同 stream() 口径)。
             if (snRuntime) {
               snConnector?.recordSpendFor(snRuntime.name, data.usage, 0);
@@ -1494,7 +1571,27 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
             // 🧯 **上游说装不下 → 裁一半重发**(同 stream() 口径,理由见那里的长注释)。
             // 非流式这一路主要是 `/compact` 之类的聚合请求,同样是「压缩上下文
             // 反而被上下文长度打死」的重灾区。
-            const overflow = isContextOverflow(gerr.detail, gerr.kind, sentPromptTokens);
+            // 🪟 端点**实际**输入窗口(声明值与实测值取小):同 stream() 口径。
+            const windowTokens = effectiveWindowTokens(
+              item.endpoint.maxInputTokens,
+              item.endpoint.endpointId,
+            );
+            // 🪟 **上游把「装不下」说成「调用失败」**(2026-11-26):同 stream() 口径。
+            const maskedOverflow = isMaskedOverflow(
+              gerr.detail,
+              gerr.kind,
+              sentPromptTokens,
+              windowTokens,
+            );
+            if (maskedOverflow) {
+              maskedOverflowNotice = describeMaskedOverflow(sentPromptTokens, windowTokens);
+            }
+            const overflow = isContextOverflow(
+              gerr.detail,
+              gerr.kind,
+              sentPromptTokens,
+              windowTokens,
+            );
             // 🛡️ 11128 渠道校验拦截不罚账号(同 stream() 口径,见那里的说明)。
             const channelReject = isWorkbuddyChannelReject(gerr, item.endpoint.protocol);
             // 🆕 限流型「一单吃掉大半个配额」→ 同口径瘦身(理由与不学乖的取舍见
@@ -1568,6 +1665,14 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
               } catch {
                 /* 通知失败不影响请求路径 */
               }
+            }
+            // 🧯 **上游把「装不下」说成「调用失败」**(2026-11-26):同 stream() 口径。
+            if (maskedOverflowNotice !== null) {
+              throw new UpstreamError(
+                UpstreamErrorKind.BadRequest,
+                maskedOverflowNotice,
+                { statusCode: httpStatusOf(gerr) },
+              );
             }
             // 🧯 同 stream() 口径:上下文超窗压到底仍被拒 → 不换档,直接给出
             // 能读懂的错(原始是裸 code 3 / context_length_exceeded)。

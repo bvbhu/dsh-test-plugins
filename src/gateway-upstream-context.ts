@@ -259,6 +259,39 @@ export function estimateMessagesTokens(
   return total;
 }
 
+/**
+ * 工具定义数组(`tools`)的 token 数。
+ *
+ * ⚠️ **上游把 `tools` 也算进 prompt_tokens**(2026-11-26 实测:tokenrhythm/
+ * egg-alpha-003,10 个工具定义、每个 5000 字符描述 → 上游 prompt_tokens
+ * +36,966;同样的增量在 `tool_calls.arguments`(+36,880)与 tool 结果(+36,401)
+ * 上都能复现)。而我们原来的估算**只量 `messages`** —— 工具定义整段没算进去。
+ *
+ * DSH 会话的工具集通常有 20~40 个定义(每个几百到几千字符),漏算它等于
+ * 系统性低估好几万 token:「以为装得下」→ 真发出去 → 上游 400。
+ */
+export function estimateToolsTokens(
+  tools: readonly unknown[] | null | undefined,
+  count: TextCounter = estimateTextTokens,
+): number {
+  if (!Array.isArray(tools) || tools.length === 0) return 0;
+  try {
+    return count(JSON.stringify(tools));
+  } catch {
+    // 循环引用等极端情况:按「每个工具 64 token」兜底,宁可少算也别抛。
+    return tools.length * 64;
+  }
+}
+
+/** 整条请求(messages **+ 工具定义**)的 prompt 侧 token 数。 */
+export function estimateRequestTokens(
+  messages: readonly ChatMessage[],
+  tools?: readonly unknown[] | null,
+  count: TextCounter = estimateTextTokens,
+): number {
+  return estimateMessagesTokens(messages, count) + estimateToolsTokens(tools, count);
+}
+
 // ---------------------------------------------------------------------------
 // 裁剪
 // ---------------------------------------------------------------------------
@@ -511,6 +544,109 @@ export function mentionsNonOverflowFailure(detail: string): boolean {
   return NON_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+// ---------------------------------------------------------------------------
+// 「伪装成调用失败的超限」(2026-11-26 tokenrhythm/egg-alpha-003 实测)
+// ---------------------------------------------------------------------------
+
+/**
+ * 上游把「装不下」说成「模型调用失败」时用的那套话术。
+ *
+ * ## 实测(2026-11-26,tokenrhythm/egg-alpha-003)
+ *
+ * 用同一批中文语料(仓库里 7 篇真实文档)按不同倍数重放:
+ *
+ * | prompt tokens | 上游答复 |
+ * |---|---|
+ * | 118,969 | 200 |
+ * | 237,901 | 200 |
+ * | 356,847 | 200 |
+ * | ≈358,3xx | **400「模型 egg-alpha-003 调用失败，请提供 traceId 联系管理员核查」** |
+ *
+ * 也就是说:**上游的窗口就在 ~357K tokens,越线后它不回
+ * `context_length_exceeded`,而是回一句「模型调用失败,请联系管理员」** ——
+ * 用户看到这句话只会去联系厂商,永远不知道自己该 /compact。
+ *
+ * ## 为什么不能一刀切
+ *
+ * 同一句文案在**小请求**上是真的上游故障(2026-11-26 08:50 那批:报文估算
+ * 28.4 万 token,远在窗口内,上游自己挂了)。所以判据必须**同时**看尺寸:
+ * 只有「文案像超限」**且**「请求确实贴着窗口」时,才按超限处理。
+ */
+const MASKED_OVERFLOW_PATTERNS: readonly RegExp[] = [
+  /模型\s+[\w.\-]+\s+调用失败/,
+  /请\s*提供\s*traceId/i,
+  /请联系管理员|联系管理员核查/,
+  /MODEL_CALL_FAILED/i,
+];
+
+/**
+ * 「贴着窗口」的比例线:估算 ≥ 窗口 × 0.9 才算「可能装不下」。
+ *
+ * 取 0.9 而不是更低:实测那条**真超限**的请求是 35.5 万估算 / 36 万窗口
+ * (0.986),而**真·上游故障**的那批是 28.4 万 / 36 万(0.79)—— 0.9 正好把
+ * 两者分开,又不至于把「窗口 1M、请求 30 万」这种明显安全的请求误判。
+ */
+export const MASKED_OVERFLOW_WINDOW_RATIO = 0.9;
+
+/** 文案是不是那套「把超限说成调用失败」的话术。 */
+export function mentionsMaskedOverflow(detail: string): boolean {
+  const text = detail ?? "";
+  return MASKED_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
+ * 这次失败是不是「**装不下,但上游把话术换了**」。
+ *
+ * 判据两条都要满足:
+ * ① 文案是那套「模型调用失败 / 请提供 traceId」的话术(上游在装不下时才这么说);
+ * ② 请求确实**贴着端点窗口**(估算 ≥ 窗口 × {@link MASKED_OVERFLOW_WINDOW_RATIO})。
+ *
+ * ⚠️ **窗口未知时不判**:没有窗口就无从判断「贴着」—— 这时保守地按上游故障处理
+ * (换档),而不是替上游猜它到底是不是超限(2026-11-26 用户定案:小请求上的
+ * 同款文案是上游故障,该换档而不是让用户去 /compact)。
+ *
+ * @param detail          上游原文(`gerr.detail`)。
+ * @param kind            归一后的错误族(`gerr.kind`)。
+ * @param estimatedTokens 本次实际发出的 prompt 估算(已含工具定义、已按上游口径校准)。
+ * @param windowTokens    端点的输入窗口上限(声明值与实测值取小);未知 → null。
+ */
+export function isMaskedOverflow(
+  detail: string,
+  kind: string,
+  estimatedTokens: number,
+  windowTokens: number | null | undefined,
+): boolean {
+  if (!mentionsMaskedOverflow(detail)) return false;
+  if (kind !== "bad_request" && kind !== "invalid_request") return false;
+  if (!(estimatedTokens > 0)) return false;
+  if (typeof windowTokens !== "number" || !Number.isFinite(windowTokens) || windowTokens <= 0) {
+    return false;
+  }
+  return estimatedTokens >= windowTokens * MASKED_OVERFLOW_WINDOW_RATIO;
+}
+
+/**
+ * 伪装超限的**诚实说法** —— 给用户看的那句话。
+ *
+ * 要点:① 说清是**请求太大**;② 给出估算值与窗口值,让人能自己判断;
+ * ③ 点明上游用了「调用失败」这种**误导性措辞**,免得他去联系厂商;
+ * ④ 给可执行的下一步(/compact / 新建会话 / 换窗口更大的模型)。
+ */
+export function describeMaskedOverflow(
+  estimatedTokens: number,
+  windowTokens: number | null | undefined,
+): string {
+  const window =
+    typeof windowTokens === "number" && Number.isFinite(windowTokens) && windowTokens > 0
+      ? `该端点输入窗口约 ${Math.floor(windowTokens)} tokens`
+      : "该端点输入窗口未知";
+  return (
+    `请求超出模型上下文窗口(本次请求估算 ${estimatedTokens} tokens,${window})。` +
+    `上游把「装不下」回成了「模型调用失败 / 请联系管理员」,那条措辞是误导的。` +
+    `请执行 /compact 或新建会话再试,或改用输入窗口更大的模型。`
+  );
+}
+
 /**
  * 这次失败是不是「装不下」。
  *
@@ -529,12 +665,20 @@ export function mentionsNonOverflowFailure(detail: string): boolean {
  * @param detail          上游原文(`gerr.detail`)。
  * @param kind            归一后的错误族(`gerr.kind`)。
  * @param estimatedTokens 本次实际发出的 prompt 估算。
+ * @param windowTokens    端点输入窗口上限(声明值与实测值取小);用于识别
+ *                        「伪装成调用失败的超限」(见 {@link isMaskedOverflow})。
  */
 export function isContextOverflow(
   detail: string,
   kind: string,
   estimatedTokens: number,
+  windowTokens?: number | null,
 ): boolean {
+  // ⚠️ 伪装超限**先判**(2026-11-26):上游把「装不下」说成「模型调用失败」时,
+  // 文案本身看不出是超限 —— 但只要请求确实贴着窗口,那它就是超限(实测
+  // tokenrhythm/egg-alpha-003:357K 之内一律 200,越过就回「请联系管理员」)。
+  // 这条必须在下面的「明确否决」**之前**:否决表里正好有这几句话术。
+  if (isMaskedOverflow(detail, kind, estimatedTokens, windowTokens)) return true;
   if (mentionsNonOverflowFailure(detail)) return false;
   if (mentionsContextOverflow(detail)) return true;
   const badRequest = kind === "bad_request" || kind === "invalid_request";
@@ -635,6 +779,87 @@ export function resetObservedCeilings(): void {
   observedCeilings.clear();
 }
 
+// ---------------------------------------------------------------------------
+// 上游口径校准(用上游回传的 usage 反推我们的估算)
+// ---------------------------------------------------------------------------
+
+/**
+ * 端点 → 「上游报的 prompt_tokens ÷ 我们估的 token」的比值。
+ *
+ * ## 为什么需要它(2026-11-26 实测)
+ *
+ * 我们的字宽估算**系统性偏低**:用仓库里 7 篇真实中文文档(267,708 字符)
+ * 重放同一个请求,我们估 113,209,上游报 **118,969** —— 低了约 9%
+ * (真实 CJK 口径 0.826 token/字,我们按 0.75 算)。ASCII 口径 3.4 字/token
+ * 则是准的。
+ *
+ * 「低估」的代价很具体:**以为装得下 → 真发出去 → 上游 400**。用户等一轮
+ * 30 秒,拿回一句误导性的错误文案。
+ *
+ * 上游每次成功都会回报 `usage.prompt_tokens` —— 那就是**上游口径的真相**。
+ * 拿它反推「我们该乘多少」,比继续调字宽常数靠谱:不同厂商的 tokenizer、
+ * 不同内容的混合比例,都会体现在这个比值上。
+ *
+ * 只在内存里(同 {@link observedCeilings} 的取舍:进程重启后重新学一次,
+ * 代价是几轮请求,不值得为它写库)。
+ */
+const promptScales = new Map<string, number>();
+
+/**
+ * 记一笔「这次我们估 N,上游报 M」→ 该端点的估算比例 = M/N。
+ *
+ * 取**见过的最大值**:宁可高估(提前发现装不下、给出诚实提示),也不要低估
+ * (把必然失败的请求发出去)。比值夹在 [0.5, 4] —— 离谱的样本(比如上游把
+ * 缓存命中的部分少报了)不该把整台端点的估算带偏。
+ */
+export function notePromptUsage(
+  endpointId: string,
+  estimatedTokens: number,
+  actualTokens: number,
+): void {
+  if (!(estimatedTokens > 0) || !(actualTokens > 0)) return;
+  const ratio = actualTokens / estimatedTokens;
+  if (!Number.isFinite(ratio) || ratio <= 0) return;
+  const clamped = Math.min(4, Math.max(0.5, ratio));
+  const previous = promptScales.get(endpointId);
+  promptScales.set(endpointId, previous === undefined ? clamped : Math.max(previous, clamped));
+}
+
+/** 该端点的估算比例(没校准过 → 1)。 */
+export function promptScale(endpointId: string): number {
+  return promptScales.get(endpointId) ?? 1;
+}
+
+/** 清空校准结果(测试用;运行时不调)。 */
+export function resetPromptScales(): void {
+  promptScales.clear();
+}
+
+/**
+ * 端点**实际**的输入窗口上限(声明值与实测值取小;都没有 → null)。
+ *
+ * 「声明值」来自库里的 `max_input_tokens`(可能是厂商自己吹的:tokenrhythm/
+ * egg-alpha-003 声明 1,000,000,实测上限 ~357K);「实测值」来自
+ * {@link observedCeilings}(那一发是真的被拒过)。
+ *
+ * @param maxInputTokens 端点声明的输入上限。
+ * @param endpointId     端点 id(用于取实测上限;省了就没有实测值)。
+ */
+export function effectiveWindowTokens(
+  maxInputTokens: number | null | undefined,
+  endpointId?: string,
+): number | null {
+  const declared =
+    typeof maxInputTokens === "number" && Number.isFinite(maxInputTokens) && maxInputTokens > 0
+      ? Math.floor(maxInputTokens)
+      : 0;
+  const learned = endpointId === undefined ? null : observedCeiling(endpointId);
+  // 声明值与实测值取小的:声明 1M 而实测 25 万时,信实测 —— 那一发是真的被拒过。
+  const ceiling =
+    declared > 0 && learned !== null ? Math.min(declared, learned) : Math.max(declared, learned ?? 0);
+  return ceiling > 0 ? ceiling : null;
+}
+
 /**
  * 本次请求的 prompt 预算。
  *
@@ -648,14 +873,8 @@ export function promptBudget(
   maxOutputTokens: number | null | undefined,
   endpointId?: string,
 ): number {
-  const declared =
-    typeof maxInputTokens === "number" && Number.isFinite(maxInputTokens) && maxInputTokens > 0
-      ? Math.floor(maxInputTokens)
-      : 0;
-  const learned = endpointId === undefined ? null : observedCeiling(endpointId);
-  // 声明值与实测值取小的:声明 1M 而实测 25 万时,信实测 —— 那一发是真的被拒过。
-  const ceiling = declared > 0 && learned !== null ? Math.min(declared, learned) : Math.max(declared, learned ?? 0);
-  if (!(ceiling > 0)) return 0;
+  const ceiling = effectiveWindowTokens(maxInputTokens, endpointId);
+  if (ceiling === null) return 0;
   const output =
     typeof maxOutputTokens === "number" && Number.isFinite(maxOutputTokens) && maxOutputTokens > 0
       ? Math.floor(maxOutputTokens)
