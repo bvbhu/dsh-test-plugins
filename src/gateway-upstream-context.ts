@@ -489,9 +489,23 @@ const NON_OVERFLOW_PATTERNS: readonly RegExp[] = [
   /unsupported\s+image/i,
   /image\s+(?:too\s+large|not\s+supported)/i,
   /(?:invalid|malformed)\s+attachment/i,
+  // 2026-11-26（tokenrhythm/egg-alpha-003 生产故障）扩展到非图像模型：
+  // 上游 400 「模型 xxx 调用失败，请提供 traceId 联系管理员核查」是**上游侧
+  // 调用故障**（同一会话历史稍后换号即恢复），不是「装不下」。旧启发式把它
+  // 判成 overflow → 包装成「请求超出模型上下文窗口」且不换档，用户被误导去
+  // /compact。这里点名否决；同理的还有 bili 预检失败（压缩摘要调用本身被拒）。
+  /模型\s+[\w.\-]+\s+调用失败/,
+  /请\s*提供\s*traceId/i,
+  /请联系管理员|联系管理员核查/,
+  /preflight_compress_failed/i,
+  /permission_error/i,
+  /MODEL_CALL_FAILED/i,
+  /internal[_\s]?error|internal server error/i,
+  /(?:模型|model)\s*(?:过载|繁忙|不可用|unavailable|overloaded)/i,
+  /failed to (?:invoke|call|run) (?:the )?model/i,
 ];
 
-/** 文案是否明确指向「图片/附件格式问题」（这类错误永远不是上下文超窗）。 */
+/** 文案是否明确指向「图片/附件格式问题」或「上游调用故障」（这类错误永远不是上下文超窗）。 */
 export function mentionsNonOverflowFailure(detail: string): boolean {
   const text = detail ?? "";
   return NON_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text));
@@ -507,7 +521,10 @@ export function mentionsNonOverflowFailure(detail: string): boolean {
  * 3. 其余 → 不是。
  *
  * ⚠️ 2026-11-26：先看 {@link mentionsNonOverflowFailure} —— 图片/附件格式错误
- * 即使 token 很大也不是「装不下」，不能被第 2 档启发式吞掉。
+ * 或**上游调用故障**（tokenrhythm「模型调用失败，请提供 traceId」、bili
+ * `preflight_compress_failed` 等）即使 token 很大也不是「装不下」，不能被
+ * 第 2 档启发式吞掉 —— 那类错误该走**换档**（换号/换成员往往立刻就好），
+ * 而不是伪装成「上下文超窗」让用户去 /compact。
  *
  * @param detail          上游原文(`gerr.detail`)。
  * @param kind            归一后的错误族(`gerr.kind`)。
