@@ -77,4 +77,14 @@ describe("qoder 出站改写（2026-11-26）", () => {
     expect(out).not.toContain("the the");
     expect(out).toContain("names the deployment assistant implementation checkout");
   });
+
+  it("上游黑名单里的另一条身份句（Claude Code）也被换成中性头", () => {
+    const text =
+      "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.\n\n后面的正常指令。";
+    const out = rewriteHostIdentityText(text);
+    expect(out.toLowerCase()).not.toContain("you are claude code");
+    expect(out.toLowerCase()).not.toContain("claude agent sdk");
+    expect(out).toContain("You are a helpful assistant.");
+    expect(out).toContain("后面的正常指令。");
+  });
 });
