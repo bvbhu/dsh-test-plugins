@@ -128,6 +128,10 @@ export function createdOf(): number {
  * 判据只有一条:{@link isWorkbuddyWire}(`protocol`)—— `protocol === "workbuddy"`。
  * 它同时决定「走不走 workbuddy 线格式」「挂不挂渠道校验闸门」「改不改提示词」。
  *
+ * ⚠️ 2026-11-26 用户定案:**`qoder` 也改写提示词**（同一张重写表）。Qoder 的
+ * `10605` 有「内容准入」形态（p1 身份句 / p3 品牌短语），命中即秒拒且重试无效；
+ * 出站前重写是唯一不依赖重试的处置（见 `docs/third-party-sources.md` §2）。
+ *
  * ⚠️ 2026-10-31 用户定案,**收回 2026-10-28 的「按名字放宽」**:名字带
  * workbuddy/wb 但 protocol=openai 的 provider(如用户自建的 `workbuddy_yn`,
  * base_url 指向转售站)一律走纯 OpenAI 形状、不挂闸门、不改提示词 ——
@@ -216,6 +220,20 @@ export function bodyForProtocol(
       const rewritten = rewriteHostIdentity(body.messages as unknown[]);
       if (rewritten !== body.messages) body.messages = rewritten;
     }
+    return body;
+  }
+  if (protocol === "qoder") {
+    // 2026-11-26 用户定案：**允许改写系统提示词**。
+    //
+    // Qoder 上游对出站文本做「宿主身份句 / 品牌短语」的内容准入：命中即
+    // `10605`（p1 身份句硬拒绝、p3 内容准入，见 docs/third-party-sources.md
+    // §2「已知背景」的第四态）。这里与 workbuddy 共用同一张重写表
+    // （core/connectors/workbuddy-gate.ts 的 HOST_IDENTITY_REWRITES），
+    // 发出去的报文里不存在宿主身份句；扫描面仍是 system / developer /
+    // assistant，user / tool 原文不动（那是用户自己的文字）。
+    const body = bodyFor(req);
+    const rewritten = rewriteHostIdentity(body.messages as unknown[]);
+    if (rewritten !== body.messages) body.messages = rewritten;
     return body;
   }
   // openai 兼容与未知协议:通用 OpenAI 形状。

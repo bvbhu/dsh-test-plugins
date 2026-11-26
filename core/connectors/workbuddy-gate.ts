@@ -169,7 +169,7 @@ const HOST_IDENTITY_REWRITES: readonly (readonly [RegExp, string])[] = [
   // ③ Web GUI 自述。**先于**通用品牌替换:那条会把句子改成
   // 「the the deployment assistant Web GUI」的病句。
   [
-    /\byou\s+are\s+interacting\s+with\s+the\s+user\s+through\s+the\s+deepseek\s+harness\b/giu,
+    /\byou\s+are\s+interacting\s+with\s+the\s+user\s+through\s+the\s+deepseek\s+harness(?:\s+web\s+gui)?\b/giu,
     "You are interacting with the user through the web interface",
   ],
   // ①② agent 身份从句(含 `a coding agent powered by <model> model` 这种
@@ -201,7 +201,13 @@ const HOST_IDENTITY_REWRITES: readonly (readonly [RegExp, string])[] = [
     "$1that $2",
   ],
   // 兜底:品牌短语的其它出现(门 B 的精确子串)。放在最后,不抢上面那条的活。
-  [/deepseek\s+harness/giu, "the deployment assistant"],
+  //
+  // ⚠️ 2026-11-26:先吃掉前置的 "the",否则 DSH 的
+  // `The runtime context names the DeepSeek Harness implementation checkout.`
+  // 会被改成 `names the the deployment assistant …`(the the 病句)。
+  // 两条都保留 "the deployment assistant" 这个替换值 —— 与既有测试/语义一致。
+  [/\bthe\s+deepseek\s+harness\b/giu, "the deployment assistant"],
+  [/\bdeepseek\s+harness\b/giu, "the deployment assistant"],
 ];
 
 /**
