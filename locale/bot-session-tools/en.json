@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "Provides the four session tools: search_sessions, deliver_message, send_to_session, and read_session."
+  }
+}

@@ -8,11 +8,12 @@
  * 与 `scheduler/engine-health.ts` 的头注释。
  *
  * ⚠️ **改过默认值要同步的地方**（都走 {@link defaultConcurrencyOf}，别再写死 1）：
- * - `packages/dsh-plugin/src/repo.ts`（运行态端点行，db 没行时兜底）
- * - `apps/electron/src/main/core-repo.ts`（同上，桌面端）
- * - `packages/core/src/scheduler/engine.ts`（InMemoryProviderRegistry，测试夹具）
- * - `packages/core/src/router/types.ts`（EndpointData 归一化兜底）
- * - `packages/panel/src/models.ts`（手工登记新模型时的库初值）
+ * - `src/repo.ts`（运行态端点行，db 没行时兜底）
+ * - `core/src/scheduler/engine.ts`（InMemoryProviderRegistry，测试夹具）
+ * - `core/src/router/types.ts`（EndpointData 归一化兜底）
+ * - `panel/src/models.ts`（手工登记新模型时的库初值）
+ * （历史清单里曾有 `apps/electron/src/main/core-repo.ts`（桌面端）——electron 版
+ * 已废弃，该同步点作废。）
  *
  * 逐渠道缺省（2026-11-08 用户定案：**除 sensenova / workbuddy 外统一 3**）：
  *

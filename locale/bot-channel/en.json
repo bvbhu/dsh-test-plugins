@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "Holds the SnowLuma (OneBot v11) connection, routes privileged chat tiers, and resolves quoted replies."
+  }
+}

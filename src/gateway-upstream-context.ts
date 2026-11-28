@@ -96,8 +96,27 @@ const TOOL_KEEP_TAIL_CHARS = 300;
  */
 const GENERIC_OVERFLOW_MIN_TOKENS = 128_000;
 
-/** 一次请求最多自动压缩几轮(每轮把量出来的长度砍半:1 → 1/2 → 1/4 → 1/8)。 */
-export const MAX_CONTEXT_SHRINKS = 0;
+/**
+ * 泛化 400 判「超窗」的**窗口占比**门槛(2026-11-28 新增)。
+ *
+ * 只有在拿不到窗口声明时才退回 {@link GENERIC_OVERFLOW_MIN_TOKENS} 的绝对
+ * 长度;拿得到窗口时,请求必须吃掉窗口的 90% 以上,才可能真是「装不下」。
+ *
+ * 90% 的由来:sensenova/deepseek-flash 实测 1,019,887 tokens 仍 200,越过
+ * 1,048,576 才 400 —— 真实超窗一定落在窗口 95%+ 附近;而 338K 的参数类 400
+ * 只占 1M 窗口的 32%,绝不该判超窗。留 10% 余量给 chat template 等不可见开销。
+ */
+const GENERIC_OVERFLOW_WINDOW_RATIO = 0.9;
+
+/**
+ * 一次请求最多自动压缩几轮(每轮把量出来的长度砍半:1 → 1/2 → 1/4 → 1/8)。
+ *
+ * 2026-11-28 恢复为 1:初始重构(46bd60a)里被设成 0,但整套砍半重发逻辑
+ * (noteContextOverflow / contextCapHint / voidAttempt)都保留着,0 让它们变成
+ * 死代码,还把超窗文案变成「已自动压缩 0 次」这句空话。设为 1 = 真超窗时砍到
+ * 一半重发一次,足以救回贴着窗口的请求,也不会无限重试。
+ */
+export const MAX_CONTEXT_SHRINKS = 1;
 
 /** 文本 → token 数。默认实现是字符加权估算,DeepSeek 系换成官方分词器。 */
 export type TextCounter = (text: string) => number;
@@ -682,7 +701,20 @@ export function isContextOverflow(
   if (mentionsNonOverflowFailure(detail)) return false;
   if (mentionsContextOverflow(detail)) return true;
   const badRequest = kind === "bad_request" || kind === "invalid_request";
-  return badRequest && estimatedTokens >= GENERIC_OVERFLOW_MIN_TOKENS;
+  if (!badRequest) return false;
+  // 🔬 泛化 400 的兜底判据(2026-11-28 修订):必须**相对窗口**看,不能只看
+  // 绝对长度。旧写法 `estimatedTokens >= 128_000` 对大窗口模型的参数错误是
+  // 灾难 —— sensenova/deepseek-flash 实测真实窗口 1,048,576 tokens,338K 的
+  // 请求(仅占窗口 32%)因为一句 strict-schema 的 `inference request is
+  // invalid` 被误判成「超窗」,用户被误导去 /compact。窗口已知时按比例判:
+  // 真超窗的请求必然贴着或越过窗口(§GENERIC_OVERFLOW_WINDOW_RATIO)。
+  const window = typeof windowTokens === "number" && Number.isFinite(windowTokens)
+    ? windowTokens
+    : 0;
+  if (window > 0) {
+    return estimatedTokens >= window * GENERIC_OVERFLOW_WINDOW_RATIO;
+  }
+  return estimatedTokens >= GENERIC_OVERFLOW_MIN_TOKENS;
 }
 
 /**
@@ -747,10 +779,14 @@ export function isRateLimitOversize(
 /**
  * 端点 → 「实测被拒过的 prompt 长度」。
  *
- * 为什么要有:**库里的 `max_input_tokens` 可能是错的**(用户手填 1M,上游实际
- * 只认 25 万 —— 本文件的故障就是这种:声明 1048576,1.27M 字符的报文照样被
- * `context_length_exceeded` 打回)。发之前的裁剪只能信库里的数字,于是第一发
- * 必然白跑;把「被拒的长度」记下来,后续请求就能一次裁到位。
+ * 为什么要有:**库里的 `max_input_tokens` 可能比上游真实窗口大**(例如某些端点
+ * 声明 1M、实际更早就被拒)。发之前的裁剪只能信库里的数字,于是第一发可能
+ * 白跑;把「被拒的长度」记下来,后续请求就能一次裁到位。
+ *
+ * 2026-11-28 修订:旧注释拿 sensenova 举例说「声明 1048576、实际只认 25 万」
+ * 是**错的** —— 真实端点实测证实该模型上下文就是 1,048,576 tokens(1.9M 字符
+ * 混合中文 = 1,019,887 tokens 仍 200,2.0M ≈1.08M 才 400)。那段话来自早期用
+ * 重复语料测出的假象,不能代表真实窗口。
  *
  * 只在内存里:进程重启后忘掉,重新学一次(代价 = 一轮大请求),不值得为它写库。
  */

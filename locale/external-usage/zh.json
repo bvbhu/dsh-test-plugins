@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "采集网关外用量并写入 stats_external_daily。"
+  }
+}

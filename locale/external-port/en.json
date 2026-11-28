@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "OpenAI-compatible gateway surface (/v1/models, /v1/chat/completions, /v1/messages)."
+  }
+}

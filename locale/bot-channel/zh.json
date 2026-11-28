@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "维护 SnowLuma（OneBot v11 正向 WS）连接、分级路由并识别回复引用。"
+  }
+}

@@ -11,9 +11,11 @@
  * 复用 core 导出:requireKey(auth.js)、clientDisconnectSignal(sse.js)、
  * forwardStream / upstreamErrorToHttp / GatewayHttpError(server.js)。
  *
- * ⚠️ parity:与 electron 的 gateway 面一致地**派生会话号**、**透传缓存路由键**、
- * **请求结束落一次 stats_daily + 明细日志**(`rt.onRequestDone`)——否则插件版的
+ * ⚠️ 自洽要求:**派生会话号**、**透传缓存路由键**、**请求结束落一次
+ * stats_daily + 明细日志**(`rt.onRequestDone`)——否则插件版的
  * 面板统计页永远是空的、会话粘性也拿不到 sessionId。
+ * (历史:这些行为最初是为与 electron gateway 面 parity 而记;electron 版
+ * 已废弃,现在是插件自身统计/粘性能工作的必要条件。)
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";

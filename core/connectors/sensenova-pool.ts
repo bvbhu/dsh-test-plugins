@@ -35,14 +35,17 @@ export const BILLABLE_WINDOW_S = 60;
  */
 export const COOLDOWN_ON_HOLD = 5;
 /**
- * 单账号累计等待预算(秒)。
+ * 单账号等待的**轮数上限**(每轮秒数 = 最长等待步长:窗口型 60s / 瞬时型 5s)。
  *
- * 2026-11-18 用户定案：100 → **50**，且**耗尽不再算错误**。
- * 它现在只是「同号节奏窗口」——一轮等满就重置计时继续请求同号同模型，
- * 真正的终止条件是外层请求的总超时预算（`real.wait_budget_s`）。
+ * 2026-11-18 用户定案：100s → **50**，且**耗尽不再算错误**。
+ * 2026-11-28 修正语义：它不是「总等待秒数」而是「单轮等待预算」—— 轮满即
+ * **重置预算继续等同一个号**，唯一的终止条件是外层请求总超时预算
+ * (`real.wait_budget_s`)。此前按秒数计数会与总预算双计:窗口型 429 等满
+ * 一轮(50s)就把外层 60s 预算烧光,abort 打断连接器,大请求永远等不到窗口
+ * 滑过去(实测 09:03 后 5 次 429 全以 latency=600s 收场)。
  * 详见 `sensenova.ts` 的 {@link SensenovaAdapter.runWithAccount}。
  */
-export const ACCOUNT_WAIT_BUDGET_S = 50;
+export const ACCOUNT_WAIT_ROUNDS = 50;
 /** 健康度滚动窗口(秒)。 */
 export const HEALTH_WINDOW_S = 300;
 /**

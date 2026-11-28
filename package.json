@@ -1,6 +1,6 @@
 {
   "name": "@bvbhu/as-one",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "As One 网关的 DSH 插件：多账号模型路由 + OpenAI 兼容网关面，挂进 DSH 原生模型选择器。",
   "type": "module",
   "main": "lib/index.js",
@@ -10,12 +10,41 @@
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
+    "./core": "./lib/core.js",
+    "./subagent": "./lib/subagent.js",
+    "./external-port": "./lib/external-port.js",
+    "./external-usage": "./lib/external-usage.js",
+    "./bot-channel": "./lib/bot-channel.js",
+    "./bot-mhy": "./lib/bot-mhy.js",
+    "./bot-chat": "./lib/bot-chat.js",
+    "./bot-assistant": "./lib/bot-assistant.js",
+    "./bot-session-tools": "./lib/bot-session-tools.js",
+    "./bot-notify": "./lib/bot-notify.js",
+    "./settings": "./lib/settings.js",
+    "./channel-trae": "./lib/channel-trae.js",
+    "./channel-workbuddy": "./lib/channel-workbuddy.js",
+    "./channel-sensenova": "./lib/channel-sensenova.js",
+    "./channel-minimax": "./lib/channel-minimax.js",
+    "./channel-qoder": "./lib/channel-qoder.js",
+    "./channel-codearts": "./lib/channel-codearts.js",
     "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./core/locale/*.json": "./locale/core/*.json",
+    "./subagent/locale/*.json": "./locale/subagent/*.json",
+    "./external-port/locale/*.json": "./locale/external-port/*.json",
+    "./external-usage/locale/*.json": "./locale/external-usage/*.json",
+    "./bot-channel/locale/*.json": "./locale/bot-channel/*.json",
+    "./bot-mhy/locale/*.json": "./locale/bot-mhy/*.json",
+    "./bot-chat/locale/*.json": "./locale/bot-chat/*.json",
+    "./bot-assistant/locale/*.json": "./locale/bot-assistant/*.json",
+    "./bot-session-tools/locale/*.json": "./locale/bot-session-tools/*.json",
+    "./bot-notify/locale/*.json": "./locale/bot-notify/*.json"
   },
   "files": [
     "lib",
+    "locale",
     "cordis.patch.yml",
     "README.md",
     "DETAILS.md"
@@ -84,13 +113,14 @@
     "url": "git+https://github.com/bvbhu/dsh-as-one.git"
   },
   "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.19.0",
     "@types/node": "^24.0.0",
     "@types/react": "^18.3.31",
-    "typescript": "^5.9.3",
-    "vitest": "^4.1.8",
     "esbuild": "^0.28.2",
+    "postcss": "^8.5.30",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "postcss": "^8.5.30"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
   }
 }

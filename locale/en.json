@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "Routes models across accounts and exposes an OpenAI-compatible gateway, wired into DSH's native model selector."
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "提供 search_sessions、deliver_message、send_to_session、read_session 四个会话工具。"
+  }
+}

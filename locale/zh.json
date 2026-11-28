@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "多账号模型路由与 OpenAI 兼容网关面，挂进 DSH 原生模型选择器。"
+  }
+}

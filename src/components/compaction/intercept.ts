@@ -182,6 +182,16 @@ export function applyCompaction(opts: ApplyCompactionOptions): () => void {
   const chainCtx: ChainContext = {
     llm: (ctx as unknown as { llm?: ChainContext["llm"] }).llm as ChainContext["llm"],
     logger: ctx.logger as unknown as ChainContext["logger"],
+    // 容量真值口（2026-11 改进）：ModelChain 没拿到显式 capacities 时逐条问这里，
+    // 用 registry 里该真实模型的 maxInputTokens / maxOutputTokens 取代 262144 的
+    // 保守默认 —— 小窗口模型被当成「装得下」只会在上游吃 400。
+    capacityOf: (provider, model) => {
+      const info = runtime.registry.getRealModel(provider, model);
+      if (!info) return null;
+      const positive = (value: unknown): number =>
+        typeof value === "number" && Number.isInteger(value) && value > 0 ? value : 0;
+      return { contextWindow: positive(info.maxInputTokens), maxTokens: positive(info.maxOutputTokens) };
+    },
     // ⚠️ as-one 适配（2026-11）：组件调 ctx.llm.stream 前必须把 provider/model
     // 翻译成 as-one 适配器能识别的「provider=as-one + model=provider/model +
     // 无 purpose」，否则真实 provider 会 NO_ADAPTER（压缩失败根因）。

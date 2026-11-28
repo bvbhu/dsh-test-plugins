@@ -20,6 +20,8 @@ import {
   ATTR_UNKNOWN,
   POOL_SATURATED,
   POOL_EXHAUSTED,
+  isTransientInvalidParameter,
+  MAX_TRANSIENT_400_RETRIES,
   CLIENT_ID,
   REDIRECT_URI,
   SCOPE,
@@ -1015,5 +1017,111 @@ describe("classifyError 上游原样(用户 m05267)", () => {
   it("body 为空时退化为纯 kind 文案(不出现空「上游:」)", () => {
     expect(ad.classifyError(500, "").message).toBe("上游错误");
     expect(ad.classifyError(500, null).message).toBe("上游错误");
+  });
+});
+
+describe("isTransientInvalidParameter（2026-11-28 伪 400）", () => {
+  it("只认 inference request is invalid + InvalidParameter 的 400", () => {
+    expect(
+      isTransientInvalidParameter(400, {
+        error: {
+          message: "inference request is invalid",
+          type: "invalid_request_error",
+          code: "InvalidParameter",
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isTransientInvalidParameter(
+        400,
+        '{"error":{"message":"inference request is invalid","code":"InvalidParameter"}}',
+      ),
+    ).toBe(true);
+    // code:"3" 的同文案另有「坏图」等真错误语义，不能进瞬态重试。
+    expect(
+      isTransientInvalidParameter(400, {
+        error: { message: "inference request is invalid", code: "3" },
+      }),
+    ).toBe(false);
+    expect(isTransientInvalidParameter(400, { error: { message: "bad model" } })).toBe(false);
+    expect(isTransientInvalidParameter(429, { error: { code: "InvalidParameter" } })).toBe(false);
+  });
+
+  it("runWithAccount: 伪 400 同号有界重试，第 3 次即成功（真实会话场景）", async () => {
+    let calls = 0;
+    const fetchFn = (async (_url: string, init: RequestInit) => {
+      calls += 1;
+      if (calls <= 2) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              message: "inference request is invalid",
+              type: "invalid_request_error",
+              code: "InvalidParameter",
+            },
+          }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    const adapter = new SensenovaAdapter(
+      [
+        { username: "a", api_key: "ka" },
+        { username: "b", api_key: "kb" },
+      ],
+      fetchFn,
+    );
+    const out = await adapter.runWithAccount(
+      "https://x/v1/chat/completions",
+      {},
+      "deepseek-flash",
+      { apiKey: "ka" },
+      undefined,
+      0.01,
+    );
+    expect(out.res.ok).toBe(true);
+    expect(calls).toBe(3);
+  });
+
+  it("runWithAccount: 伪 400 超过上限时交还原始 400，不无限重试", async () => {
+    let calls = 0;
+    const fetchFn = (async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: "inference request is invalid",
+            type: "invalid_request_error",
+            code: "InvalidParameter",
+          },
+        }),
+        { status: 400 },
+      );
+    }) as unknown as typeof fetch;
+    const adapter = new SensenovaAdapter([{ username: "a", api_key: "ka" }], fetchFn);
+    const err = await adapter
+      .runWithAccount("https://x/v1/chat/completions", {}, "m1", { apiKey: "ka" }, undefined, 0.01)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UpstreamError);
+    expect((err as UpstreamError).kind).toBe("bad_request");
+    expect((err as UpstreamError).message).toContain("InvalidParameter");
+    expect(calls).toBe(MAX_TRANSIENT_400_RETRIES + 1);
+  });
+
+  it("runWithAccount: 普通 400 仍立即抛，不重试", async () => {
+    let calls = 0;
+    const fetchFn = (async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ error: { message: "bad model" } }), { status: 400 });
+    }) as unknown as typeof fetch;
+    const adapter = new SensenovaAdapter([{ username: "a", api_key: "ka" }], fetchFn);
+    await expect(
+      adapter.runWithAccount("https://x/v1/chat/completions", {}, "m1", { apiKey: "ka" }, undefined, 0.01),
+    ).rejects.toMatchObject({ kind: "bad_request" });
+    expect(calls).toBe(1);
   });
 });

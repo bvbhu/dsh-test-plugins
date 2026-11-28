@@ -48,7 +48,7 @@ import {
   classify_rate_limit,
 } from "./sensenova-usage.js";
 import {
-  ACCOUNT_WAIT_BUDGET_S,
+  ACCOUNT_WAIT_ROUNDS,
   BILLABLE_WINDOW_S,
   COOLDOWN_ON_HOLD,
   SensenovaAccountPool,
@@ -102,7 +102,7 @@ export {
   pkce,
 } from "./sensenova-auth.js";
 export {
-  ACCOUNT_WAIT_BUDGET_S,
+  ACCOUNT_WAIT_ROUNDS,
   BILLABLE_WINDOW_S,
   COOLDOWN_ON_HOLD,
   HEALTH_WINDOW_S,
@@ -132,10 +132,10 @@ export type {
  * 真正滑过去;瞬时型 429(归因未知)保持短间隔 COOLDOWN_ON_HOLD。
  *
  * 返回 `Math.min(step, waitLeft)`:预算只剩一半时等一半,预算耗尽返回 0
- * (调用方在 `waitLeft <= 0` 分支直接抛 heldTooLong,不 sleep)。
+ * (调用方重置预算继续等同一个号,不 sleep;唯一终止条件是外层 signal)。
  *
  * @param rawBody 429 的原始响应体(归因只认它,空串按瞬时型处理)。
- * @param waitLeft 本请求剩余的同号等待预算(秒)。
+ * @param waitLeft 本轮剩余的同号等待预算(秒)。
  */
 export function holdDelaySeconds(rawBody: string, waitLeft: number): number {
   const attribution = classify_rate_limit(rawBody || "");
@@ -145,38 +145,50 @@ export function holdDelaySeconds(rawBody: string, waitLeft: number): number {
 }
 
 /**
+ * SenseNova 上游偶发的「伪 400」判定 —— 2026-11-28 生产故障。
+ *
+ * 同一份 470 条消息、1,621,926 字符、4 张完整图的 payload（MD5 全同），在真实
+ * 会话里连续拿到 400 `{"error":{"message":"inference request is invalid",
+ * "type":"invalid_request_error","code":"InvalidParameter"}}` ×4，夹杂 429
+ * 与断连；限流解除后**原样直连重放第 3 次就 200**（前两次仍是 429）。证明这条
+ * 400 是上游在高负载 / 限流时用统一文案表达的**瞬态失败**，不是请求非法 ——
+ * 按普通 400 直接抛会把本该成功的会话打死。
+ *
+ * 只认 `InvalidParameter` 这一形态：`code:"3"` 的同文案 400 另有「坏图」等
+ * 真错误语义（见 core/gateway/image-bridge.ts 的 data:image 校验），不能一起重试，
+ * 否则真坏请求会一直重试到外层超时。
+ */
+export function isTransientInvalidParameter(httpStatus: number, body: unknown): boolean {
+  if (httpStatus !== 400) return false;
+  const text = typeof body === "string" ? body : JSON.stringify(body ?? "");
+  return text.includes("inference request is invalid") && /InvalidParameter/i.test(text);
+}
+
+/** 伪 400 的单次请求重试上限:超过就交还原始 400,不把总预算烧光。 */
+export const MAX_TRANSIENT_400_RETRIES = 3;
+
+/**
  * SenseNova 连接器 —— 实现 {@link AuthConnector} 契约。
  *
  * 认证:`Authorization: Bearer <api_key>`
  * 端点:`/chat/completions`, 恒走 SSE
  *
- * ## 账号调度:粘性绑**真实模型**级,账号可轮换(用户 2026-11-01 定案)
+ * ## 账号调度:单账号,粘性绑**真实模型**级(用户 m23215 定案:绝不换号)
  *
- * 这条**修正**了 m23215 的「绝不换号」:那条定案的前提是「换号会把限流甩给
- * 同池下一个号 + 打散前缀缓存亲和」。实测两点都站不住:
- * - sensenova 的上游**前缀缓存跨账号共享**(按推理节点存放,与凭证无关),
- *   换账号不丢缓存亲和 —— 粘性只需绑在真实模型一级,账号是同模型下的负载分担;
- * - rpm/rps/tpm 都是**账号级**限流,死等同一个号只会把 100s 预算烧光
- *   (实测 latency 100~160s 后仍 429,用户看到「rps exhausted」)。
- *
- * 现行规则:
- * 1. **一次请求一个账号**,但 429 时**可换到池内其它空闲未冷却账号**(见
- *    {@link pickOtherAccount});换过的号进 `tried`,防 A→B→A 打转;
- * 2. **会话粘性由 Router 的 session pin 负责**(`scheduler.pin_seconds`),粘的是
- *    **真实模型**;连接器在模型内部换号不影响它;
- * 3. 换无可换 → **同号有界硬等**(窗口型等满 60s 窗口,瞬时型 5s;总预算
- *    `ACCOUNT_WAIT_BUDGET_S = 100s`);预算耗尽抛**可重试的 `rate_limit`**
- *    (带 `retryAfter`,见 {@link heldTooLong}),由客户端/上游退避;
- * 4. **新会话 / 粘性过期 → 挑一个空闲账号**({@link pickIdle}):判据只有
- *    「`inflight === 0` 且账号级没冷却」;**不看模型** —— 不同模型可以用同一个
- *    账号(冷却仍按 (账号,模型) 记录,只作面板展示,不参与选号);
- * 5. 单账号单并发(`inflight` 标记)+ 每账号一条钉连接 —— 前缀缓存按 1024-token
- *    块存在推理节点本地,单条 keep-alive 顺序请求稳定命中;
- * 6. 日志纪律:**只有窗口可计费 token < 16384 却仍 429**(什么都没发就被限流)
+ * 429 时**不换号**,同号同模型继续请求;等待按**轮**推进:
+ * 1. 429 → **同号硬等**:窗口型限流(tpm/rpm,60s 滑动)等满一个完整计费窗口
+ *    再打(短间隔刷新窗口只会永远 429),瞬时型保持 COOLDOWN_ON_HOLD;
+ * 2. **按轮推进,不按秒数终止**:一轮等待预算({@link ACCOUNT_WAIT_ROUNDS},
+ *    窗口型 60s / 瞬时型 5s)用尽只是「这一轮等短了」——重置预算继续等同一号;
+ *    唯一终止条件是外层 signal(总预算 `real.wait_budget_s` / 客户端断开)。
+ *    2026-11-28 修正:此前按秒数计数会与总预算双计,窗口型 429 等满一轮就把
+ *    外层 60s 预算烧光,abort 打断连接器,大请求永远等不到窗口滑过去;
+ * 3. **会话粘性由 Router 的 session pin 负责**(`scheduler.pin_seconds`),粘的是
+ *    **真实模型**;
+ * 4. 单账号单并发(`inflight` 标记)+ 一条钉连接 —— 前缀缓存按 1024-token 块
+ *    存在推理节点本地,keep-alive 顺序请求稳定命中;
+ * 5. 日志纪律:**只有窗口可计费 token < 16384 却仍 429**(什么都没发就被限流)
  *    才写 warn;常规 429 / 连续失败不写。
- *
- * 换号循环**在同一请求内也会换号** —— 本连接器保留了这一点
- * (见规则 1),但只在 429 时换、且换过的号不重复试。
  */
 export class SensenovaAdapter implements AuthConnector {
   readonly vendorId = "sensenova";
@@ -400,22 +412,19 @@ export class SensenovaAdapter implements AuthConnector {
   /**
    * 打一次上游 chat 请求。
    *
-   * 账号策略(用户 2026-11-01 更新定案,修正 m23215「绝不换号」):
-   * - **粘性绑定在真实模型一级**,不是账号一级 —— sensenova 上游前缀缓存
-   *   跨账号共享(按推理节点存放,与凭证无关),换账号不丢缓存亲和;
-   * - 所以池内**多个账号**时,429(账号级限流 rpm/rps/tpm)应**轮换到其它
-   *   空闲未冷却账号**继续试,而不是死等同一个号 —— 这正是「rps exhausted
-   *   报错时应该换号」的机制依据;
-   * - 换无可换(全部试过 / 全在冷却 / 池就一个号)→ 回落到**同号硬等**
-   *   (窗口型等满 60s,瞬时型 5s),预算耗尽抛 `rate_limit` 交给调用方退避。
-   *
-   * 判据顺序:
-   * 1. 选号({@link accountFor}):钉死 > 网关注入 key 属池 > 池外单账号 > 池里一个空闲号;
-   * 2. 非 429 失败(401/403/400/5xx)→ 直接抛(不换号:拿别的身份顶替会掩盖真问题);
-   * 3. 429 → 池内还有**其它**空闲未冷却账号 → 换过去重试(旧号记账号级冷却,
-   *    新会话选号会跳过它),换出的号继续试;
-   * 4. 换无可换 → 同号硬等(窗口型等满一个窗口再打,见 {@link holdDelaySeconds});
-   * 5. 预算耗尽 → 给该号记**账号级**冷却并抛 {@link heldTooLong}。
+   * 账号策略(用户 m23215 定案:**单账号,绝不换号**):
+   * - 粘性绑定在真实模型一级;429 时**不换号**,同号同模型继续请求;
+   * - 429 同号硬等:窗口型限流(tpm/rpm,60s 滑动)等满一个完整计费窗口再打
+   *   (每 5s 刷一次会把窗口永远顶在「刚打过」,实测短间隔反而持续 429),
+   *   瞬时型保持 COOLDOWN_ON_HOLD 短间隔(见 {@link holdDelaySeconds});
+   * - **按轮推进,不按秒数终止**:一轮等待预算用尽只是「这一轮等短了」,
+   *   重置预算继续等同一个号;唯一终止条件是外层 signal(总预算
+   *   `real.wait_budget_s` 耗尽 / 客户端断开)。此前按秒数计数会与总预算
+   *   双计——窗口型 429 等满一轮(50s)就把外层 60s 预算烧光,大请求永远
+   *   等不到窗口滑过去(2026-11-28 实测 5 次 429 全以 latency=600s 收场);
+   * - **例外**:`isTransientInvalidParameter()` 认出的 400 是上游限流期的
+   *   伪 400(见该函数注释),按 429 同号短等待重试,有独立次数上限;
+   * - 非 429 的其它错误(401/403/普通 400)直接抛:凭据/请求问题,等也没用。
    *
    * ⏱️ 等待时间由调用方计入 TTFT:客户端请求进入网关那一刻就是起点。
    */
@@ -425,8 +434,8 @@ export class SensenovaAdapter implements AuthConnector {
     model: string,
     creds: ConnectorCredentials,
     signal?: AbortSignal,
-    /** 同号节奏窗口(秒)。默认 {@link ACCOUNT_WAIT_BUDGET_S}；测试传 0 跳过真实等待。 */
-    waitBudgetSeconds: number = ACCOUNT_WAIT_BUDGET_S,
+    /** 单轮等待预算(秒):窗口型 60s / 瞬时型 5s。默认 {@link ACCOUNT_WAIT_ROUNDS}；测试传 0 跳过真实等待。 */
+    waitBudgetSeconds: number = ACCOUNT_WAIT_ROUNDS,
   ): Promise<{ res: Response; runtime: SensenovaAccountRuntime }> {
     // ⚠️ 有界:终止条件**只有**外层 signal（总超时预算耗尽 / 客户端断开）。
     // 2026-11-18 用户定案：同号同模型**继续请求**，一轮节奏窗口用尽就重置再来，
@@ -434,6 +443,8 @@ export class SensenovaAdapter implements AuthConnector {
     const rt = this.acquireFor(creds);
     let waitLeft = Math.max(0, waitBudgetSeconds);
     let waitedS = 0;
+    /** 伪 400 已重试次数(独立于 429 等待预算,避免一条错误吃掉 100s)。 */
+    let transient400Retries = 0;
     /** 最近一次真实上游错误：总预算耗尽时优先把它交还给调用方。 */
     let lastError: Error | undefined;
     try {
@@ -457,7 +468,28 @@ export class SensenovaAdapter implements AuthConnector {
         const text = await res.text().catch(() => "");
         const err = this.classifyError(res.status, text);
         rt.recordOutcome(false, 0, Date.now());
-        if (res.status !== 429) throw err; // 非限流:401/403 是凭据问题,换号也无用
+
+        // 上游限流期的伪 400:按 429 同样处理(同号短等待重试,有独立次数上限),
+        // 不换号 —— 换号掩盖不了上游容量问题,直连实测同号第 3 次即成功。
+        const transient400 = isTransientInvalidParameter(res.status, text);
+        if (transient400) {
+          if (transient400Retries >= MAX_TRANSIENT_400_RETRIES) throw err;
+          transient400Retries += 1;
+          lastError = err;
+          const delay = Math.min(COOLDOWN_ON_HOLD, Math.max(0, waitLeft));
+          if (delay <= 0) {
+            // 本轮预算耗尽:重置预算继续等同一个号(外层 signal 是唯一终止条件)。
+            waitLeft = Math.max(0, waitBudgetSeconds);
+            continue;
+          }
+          rt.coolFor(delay, sensenovaSnippet(text), model, Date.now());
+          await this.sleep(delay * 1000, signal);
+          waitLeft = Math.max(0, waitLeft - delay);
+          waitedS += delay;
+          continue;
+        }
+
+        if (res.status !== 429) throw err; // 非限流:401/403/普通 400 是凭据/请求问题,换号也无用
 
         const now = Date.now();
         // 记住这次真实错误 —— 总预算耗尽时优先交还它（用户定案：
@@ -484,36 +516,6 @@ export class SensenovaAdapter implements AuthConnector {
     } finally {
       this.releaseFor(rt);
     }
-  }
-
-  /**
-   * 换无可换 + 同号等待预算耗尽后的错误,交给调用方退避。
-   *
-   * 抛 `rate_limit`(可重试,HTTP 429)并带 `retryAfter = ` 一个可计费滚动窗口
-   * ({@link BILLABLE_WINDOW_S}s):网关把它当 `Retry-After` 回给客户端。
-   * 上游原文(含 `code=8` / `shared` 归因)不动,拼在消息里 —— 面板/客户端该看到
-   * 上游那句报错本身。
-   *
-   * ⚠️ 走到这里说明**池里所有号都试过/都在冷却**(单号池则只试过一个):
-   * 这是「确实没有可用的号了」,不是「懒得换」。会话粘性绑在真实模型级,
-   * 退避回来后同模型下任意一个恢复的号都能接(见 runWithAccount 头注)。
-   */
-  private heldTooLong(
-    rt: SensenovaAccountRuntime,
-    err: UpstreamError,
-    waitedS: number,
-  ): UpstreamError {
-    // ⚠️ 上游原件透传(用户 m36329):这一层只是「我们等太久了」的包装,
-    // 但客户端真正该看到的还是上游那次 429 的原文 —— 把 err.raw 原样带上去。
-    return new UpstreamError(
-      "rate_limit",
-      `[sensenova] 账号 ${rt.name || "(adhoc)"} 同号等待 ${Math.round(waitedS)}s 后仍被限流` +
-        `(池内已无可换的空闲账号,请退避约 ${BILLABLE_WINDOW_S}s 后重试) — ${err.message}`,
-      true,
-      429,
-      BILLABLE_WINDOW_S,
-      err.raw,
-    );
   }
 
   /**

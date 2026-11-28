@@ -11,6 +11,7 @@
 import { endpointIdOf } from "../scheduler/engine.js";
 import {
   CONTENT_MODES,
+  MAX_PAYLOAD_BYTES,
   dayKey,
   edges,
   parseMs,
@@ -258,7 +259,11 @@ export function writeStats(items: readonly PreparedRequestLogRow[], record: Stat
 // _detail(L1199-1233):逐请求明细行(元数据永远写全,正文按档位裁剪)
 // ---------------------------------------------------------------------------
 
-export function detail(item: PreparedRequestLogRow, mode: ContentMode): Record<string, unknown> {
+export function detail(
+  item: PreparedRequestLogRow,
+  mode: ContentMode,
+  fullLimit: number = MAX_PAYLOAD_BYTES,
+): Record<string, unknown> {
   const record: Record<string, unknown> = {
     ts: Math.round(item.ts * 1_000_000) / 1_000_000, // 6 位小数(repo.py round 语义)
     day: item.day,
@@ -287,7 +292,7 @@ export function detail(item: PreparedRequestLogRow, mode: ContentMode): Record<s
     prompt_cache_key: item.prompt_cache_key ?? null,
   };
   if (mode === "full") {
-    record.payload = trim(item.payload);
+    record.payload = trim(item.payload, fullLimit);
   } else if (mode === "edges") {
     record.payload_edges = edges(item.payload);
   } else {
@@ -373,10 +378,18 @@ export function logRequests(rows: readonly RequestLogRow[], deps: RequestLogDeps
   writeStats(items, deps.record);
   const mode = deps.getContentMode ? deps.getContentMode() : computeMode(deps.getSetting);
   if (mode !== "off") {
+    // `full` 档正文上限:设置项 `request_log.max_payload_bytes` 可**放宽**
+    // (排障时把完整请求体写下来)。只允许放宽、不允许收紧 —— 调小它等于
+    // 悄悄毁掉日志,且会踩到「任何键都返回非空值」的宽松 getSetting 实现。
+    const rawLimit = Number(deps.getSetting("request_log.max_payload_bytes"));
+    const fullLimit =
+      Number.isFinite(rawLimit) && rawLimit > MAX_PAYLOAD_BYTES
+        ? Math.floor(rawLimit)
+        : MAX_PAYLOAD_BYTES;
     const byDay = new Map<string, unknown[]>();
     for (const it of items) {
       const list = byDay.get(it.day) ?? [];
-      list.push(detail(it, mode));
+      list.push(detail(it, mode, fullLimit));
       byDay.set(it.day, list);
     }
     for (const [day, records] of byDay) deps.writer.write(day, records);
