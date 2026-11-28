@@ -236,20 +236,25 @@ describe("classify_rate_limit", () => {
 });
 
 // ---------------------------------------------------------------------------
-// holdDelaySeconds —— tpm exhausted 等待一个完整窗口
+// holdDelaySeconds —— 窗口型递增退避 / 瞬时型短间隔
 // ---------------------------------------------------------------------------
 
 describe("holdDelaySeconds", () => {
-  it("code=8 / rpm exhausted(ATTR_RPM)→ 等满 BILLABLE_WINDOW_S 窗口", () => {
-    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100)).toBe(60);
-    expect(holdDelaySeconds('{"code":8,"message":"rpm exhausted"}', 100)).toBe(60);
-    expect(holdDelaySeconds("tpm/rpm limit exceeded", 100)).toBe(60);
-    expect(holdDelaySeconds('{"code":429003,"message":"shared"}', 100)).toBe(60);
+  it("窗口型(ATTR_RPM/ATTR_SHARED)→ 按轮递增退避 5/10/20/40s", () => {
+    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 0)).toBe(5);
+    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 1)).toBe(10);
+    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 2)).toBe(20);
+    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 3)).toBe(40);
+    // 超过表长 → 停在末位 40s(累计 75s 已越过一个完整计费窗口)
+    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 9)).toBe(40);
+    expect(holdDelaySeconds('{"code":8,"message":"rpm exhausted"}', 100, 0)).toBe(5);
+    expect(holdDelaySeconds("tpm/rpm limit exceeded", 100, 1)).toBe(10);
+    expect(holdDelaySeconds('{"code":429003,"message":"shared"}', 100, 2)).toBe(20);
   });
 
-  it("窗口型但预算不足 → 预算截断(等 `Math.min(窗口, waitLeft)`)", () => {
-    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 30)).toBe(30);
-    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 0)).toBe(0);
+  it("窗口型但预算不足 → 预算截断(等 `Math.min(退避步长, waitLeft)`)", () => {
+    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 3, 3)).toBe(3);
+    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 0, 0)).toBe(0);
   });
 
   it("未知归因(非窗口型)→ 短间隔 COOLDOWN_ON_HOLD", () => {
