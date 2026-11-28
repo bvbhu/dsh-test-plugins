@@ -48,11 +48,12 @@ import {
   classify_rate_limit,
 } from "./sensenova-usage.js";
 import {
-  ACCOUNT_WAIT_ROUNDS,
   BILLABLE_WINDOW_S,
   COOLDOWN_ON_HOLD,
   SensenovaAccountPool,
   SensenovaAccountRuntime,
+  TRANSIENT_WAIT_ROUNDS_LIMIT,
+  WINDOWED_WAIT_ROUNDS_LIMIT,
   pinnedPostJson,
   sensenovaKeyFingerprint,
   sensenovaSnippet,
@@ -102,13 +103,14 @@ export {
   pkce,
 } from "./sensenova-auth.js";
 export {
-  ACCOUNT_WAIT_ROUNDS,
   BILLABLE_WINDOW_S,
   COOLDOWN_ON_HOLD,
   HEALTH_WINDOW_S,
   LOG_LOW_TPM_THRESHOLD,
   SensenovaAccountPool,
   SensenovaAccountRuntime,
+  TRANSIENT_WAIT_ROUNDS_LIMIT,
+  WINDOWED_WAIT_ROUNDS_LIMIT,
   pinnedPostJson,
   sensenovaKeyFingerprint,
   sensenovaSnippet,
@@ -178,11 +180,12 @@ export const MAX_TRANSIENT_400_RETRIES = 3;
  * 429 时**不换号**,同号同模型继续请求;等待按**轮**推进:
  * 1. 429 → **同号硬等**:窗口型限流(tpm/rpm,60s 滑动)等满一个完整计费窗口
  *    再打(短间隔刷新窗口只会永远 429),瞬时型保持 COOLDOWN_ON_HOLD;
- * 2. **按轮推进,不按秒数终止**:一轮等待预算({@link ACCOUNT_WAIT_ROUNDS},
- *    窗口型 60s / 瞬时型 5s)用尽只是「这一轮等短了」——重置预算继续等同一号;
- *    唯一终止条件是外层 signal(总预算 `real.wait_budget_s` / 客户端断开)。
- *    2026-11-28 修正:此前按秒数计数会与总预算双计,窗口型 429 等满一轮就把
- *    外层 60s 预算烧光,abort 打断连接器,大请求永远等不到窗口滑过去;
+ * 2. **轮数有界,超限交回错误码**(2026-11-28 用户定案,推翻「耗尽不再算
+ *    错误」):「不要无意义等待 —— 要么持续重试到成功,要么把错误码交回去」。
+ *    等满窗口是**必要等待**,但轮数有上限(窗口型
+ *    {@link WINDOWED_WAIT_ROUNDS_LIMIT} 轮 / 瞬时型 {@link TRANSIENT_WAIT_ROUNDS_LIMIT}
+ *    轮):超限立刻交回**上一次的真实 429**,让外层退避重试或换档,而不是
+ *    在外层 600s 预算里空转到超时;
  * 3. **会话粘性由 Router 的 session pin 负责**(`scheduler.pin_seconds`),粘的是
  *    **真实模型**;
  * 4. 单账号单并发(`inflight` 标记)+ 一条钉连接 —— 前缀缓存按 1024-token 块
@@ -417,11 +420,11 @@ export class SensenovaAdapter implements AuthConnector {
    * - 429 同号硬等:窗口型限流(tpm/rpm,60s 滑动)等满一个完整计费窗口再打
    *   (每 5s 刷一次会把窗口永远顶在「刚打过」,实测短间隔反而持续 429),
    *   瞬时型保持 COOLDOWN_ON_HOLD 短间隔(见 {@link holdDelaySeconds});
-   * - **按轮推进,不按秒数终止**:一轮等待预算用尽只是「这一轮等短了」,
-   *   重置预算继续等同一个号;唯一终止条件是外层 signal(总预算
-   *   `real.wait_budget_s` 耗尽 / 客户端断开)。此前按秒数计数会与总预算
-   *   双计——窗口型 429 等满一轮(50s)就把外层 60s 预算烧光,大请求永远
-   *   等不到窗口滑过去(2026-11-28 实测 5 次 429 全以 latency=600s 收场);
+   * - **轮数有界,超限交回错误码**(2026-11-28 用户定案):等满窗口是必要
+   *   等待,但轮数有上限(窗口型 {@link WINDOWED_WAIT_ROUNDS_LIMIT} /
+   *   瞬时型 {@link TRANSIENT_WAIT_ROUNDS_LIMIT})—— 超限立刻交回**上一次
+   *   的真实 429**,让外层退避重试或换档,而不是在外层 600s 预算里空转到
+   *   超时(「不要无意义等待:要么持续重试到成功,要么把错误码交回去」);
    * - **例外**:`isTransientInvalidParameter()` 认出的 400 是上游限流期的
    *   伪 400(见该函数注释),按 429 同号短等待重试,有独立次数上限;
    * - 非 429 的其它错误(401/403/普通 400)直接抛:凭据/请求问题,等也没用。
@@ -434,18 +437,19 @@ export class SensenovaAdapter implements AuthConnector {
     model: string,
     creds: ConnectorCredentials,
     signal?: AbortSignal,
-    /** 单轮等待预算(秒):窗口型 60s / 瞬时型 5s。默认 {@link ACCOUNT_WAIT_ROUNDS}；测试传 0 跳过真实等待。 */
-    waitBudgetSeconds: number = ACCOUNT_WAIT_ROUNDS,
+    /** 单轮等待预算(秒):窗口型 60s / 瞬时型 5s。默认一个完整计费窗口;测试传 0 跳过真实等待。 */
+    waitBudgetSeconds: number = BILLABLE_WINDOW_S,
   ): Promise<{ res: Response; runtime: SensenovaAccountRuntime }> {
-    // ⚠️ 有界:终止条件**只有**外层 signal（总超时预算耗尽 / 客户端断开）。
-    // 2026-11-18 用户定案：同号同模型**继续请求**，一轮节奏窗口用尽就重置再来，
-    // 「等满 N 秒仍限流」**不是**返回错误的理由 —— 见下方 `waitLeft <= 0` 分支。
     const rt = this.acquireFor(creds);
     let waitLeft = Math.max(0, waitBudgetSeconds);
     let waitedS = 0;
+    /** 窗口型 429 已消耗的同号等待轮数(上限 {@link WINDOWED_WAIT_ROUNDS_LIMIT})。 */
+    let windowedRounds = 0;
+    /** 瞬时型 429 已消耗的同号等待轮数(上限 {@link TRANSIENT_WAIT_ROUNDS_LIMIT})。 */
+    let transientRounds = 0;
     /** 伪 400 已重试次数(独立于 429 等待预算,避免一条错误吃掉 100s)。 */
     let transient400Retries = 0;
-    /** 最近一次真实上游错误：总预算耗尽时优先把它交还给调用方。 */
+    /** 最近一次真实上游错误:总预算耗尽 / 轮数超限时优先把它交还给调用方。 */
     let lastError: Error | undefined;
     try {
       for (;;) {
@@ -492,13 +496,24 @@ export class SensenovaAdapter implements AuthConnector {
         if (res.status !== 429) throw err; // 非限流:401/403/普通 400 是凭据/请求问题,换号也无用
 
         const now = Date.now();
-        // 记住这次真实错误 —— 总预算耗尽时优先交还它（用户定案：
+        // 记住这次真实错误 —— 轮数超限 / 总预算耗尽时优先交还它（用户定案：
         // 「返回上一次的报错信息，没有才返回超时」）。
         lastError = err;
 
         // 429：**同号同模型继续请求**（用户 2026-11-18 定案：不换号）。
-        // 一轮节奏窗口用尽是「继续等」的信号，不是返回错误的理由 ——
-        // 重置计时接着等，真正终止只由外层 signal（总预算）决定。
+        // 先按归因分轮计数：窗口型等满一个计费窗口再打（必要等待），
+        // 瞬时型短间隔；轮数超限立刻交回真实 429，不 sleep、不空耗。
+        const windowed =
+          classify_rate_limit(text || "") === ATTR_RPM ||
+          classify_rate_limit(text || "") === ATTR_SHARED;
+        if (windowed) {
+          windowedRounds += 1;
+          if (windowedRounds > WINDOWED_WAIT_ROUNDS_LIMIT) throw err;
+        } else {
+          transientRounds += 1;
+          if (transientRounds > TRANSIENT_WAIT_ROUNDS_LIMIT) throw err;
+        }
+        // 一轮节奏窗口用尽:重置计时接着等同一个号。
         if (waitLeft <= 0) {
           rt.coolAccountFor(BILLABLE_WINDOW_S, sensenovaSnippet(text), now);
           waitLeft = Math.max(0, waitBudgetSeconds);
