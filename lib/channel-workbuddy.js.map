@@ -2,6 +2,6 @@
   "version": 3,
   "sources": ["../src/channel-workbuddy-row.ts"],
   "sourcesContent": ["/**\r\n * WorkBuddy 渠道子组件（用户 m11109 定案:每渠道一个子组件,设置页一个开关）。\r\n */\r\n\r\nimport { defineChannelRow } from \"./channel-row-factory.js\";\r\n\r\nconst row = defineChannelRow(\"workbuddy\", \"WorkBuddy\");\r\n\r\nexport const name = row.name;\r\nexport const inject = row.inject;\r\nexport const Config = row.Config;\r\nexport function apply(ctx: Parameters<typeof row.apply>[0], config: Parameters<typeof row.apply>[1]): void {\r\n  row.apply(ctx, config);\r\n}\r\n"],
-  "mappings": ";;;;;AAMA,IAAM,MAAM,iBAAiB,aAAa,WAAW;AAE9C,IAAM,OAAO,IAAI;AACjB,IAAM,SAAS,IAAI;AACnB,IAAM,SAAS,IAAI;AACnB,SAAS,MAAM,KAAsC,QAA+C;AACzG,MAAI,MAAM,KAAK,MAAM;AACvB;",
+  "mappings": ";;;;;;AAMA,IAAM,MAAM,iBAAiB,aAAa,WAAW;AAE9C,IAAM,OAAO,IAAI;AACjB,IAAM,SAAS,IAAI;AACnB,IAAM,SAAS,IAAI;AACnB,SAAS,MAAM,KAAsC,QAA+C;AACzG,MAAI,MAAM,KAAK,MAAM;AACvB;",
   "names": []
 }

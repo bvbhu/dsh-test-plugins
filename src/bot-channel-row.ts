@@ -23,6 +23,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { connect as netConnect } from "node:net";
 import { existsSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
+import { WebSocket } from "ws";
 import type { Context } from "./context-types.js";
 import type { AsOneCoreService } from "./core-service.js";
 import { normalizeHistoryMessages } from "./bot-history.js";
@@ -68,17 +69,16 @@ const SNOWLUMA_PROBE_TIMEOUT_MS = 2_000;
 /** 重连退避：首delay 500ms，指数增长，上限 30s。 */
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
-/** 自实现最小 WS 类型：@types/node 无 WebSocket 全局、node_modules 无 ws 包。 */
-type MinimalSocket = {
+/** WS 客户端统一走 ws 包：宿主 Electron 的 Node 无 globalThis.WebSocket。 */
+type SocketLike = {
   readyState: number;
-  close(): void;
   send(data: string): void;
-  addEventListener(type: string, listener: (event: unknown) => void): void;
-  removeEventListener(type: string, listener: (event: unknown) => void): void;
+  close(): void;
+  on(event: string, listener: (...args: unknown[]) => void): void;
+  off(event: string, listener: (...args: unknown[]) => void): void;
 };
-type SocketCtor = new (url: string) => MinimalSocket;
 type MessageEventLike = { data?: unknown };
-const SOCKET_OPEN = 1;
+const SOCKET_OPEN = 1; // ws.OPEN
 /** 发 API 调用超时（ms）。 */
 const SEND_TIMEOUT_MS = 10_000;
 
@@ -480,7 +480,7 @@ export function apply(ctx: Context): void {
       const snowLuma = startSnowLumaSupervisor(ctx, snowLumaCfg);
       const snowLumaWsUrl = `ws://127.0.0.1:${snowLumaCfg.port}/?access_token=${SNOWLUMA_WS_TOKEN}`;
 
-      let socket: MinimalSocket | null = null;
+      let socket: SocketLike | null = null;
       let disposed = false;
       let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
       let reconnectBackoff = RECONNECT_BASE_MS;
@@ -641,17 +641,12 @@ export function apply(ctx: Context): void {
       const connect = () => {
         if (disposed) return;
         reconnectTimer = null;
-        const Ctor = (globalThis as unknown as { WebSocket?: SocketCtor }).WebSocket;
-        if (!Ctor) {
-          ctx.logger?.warn?.("[as-one] WebSocket unavailable, bot channel inert");
-          return;
-        }
-        const ws = new Ctor(snowLumaWsUrl);
+        const ws = new WebSocket(snowLumaWsUrl);
         socket = ws;
-        ws.addEventListener("open", onOpen);
-        ws.addEventListener("message", onMessage);
-        ws.addEventListener("close", onClose);
-        ws.addEventListener("error", onError);
+        ws.on("open", onOpen);
+        ws.on("message", (data) => onMessage({ data: data.toString() }));
+        ws.on("close", onClose);
+        ws.on("error", onError);
       };
 
       const channel: AsOneBotChannelService = {
@@ -732,7 +727,7 @@ export function apply(ctx: Context): void {
           ["close", onClose],
           ["error", onError],
         ] as const) {
-          socket?.removeEventListener(type, listener);
+          socket?.off(type, listener);
         }
         socket?.close(); // 只断自己的 WS；SnowLuma 进程由本行 supervisor 负责停
         socket = null;
