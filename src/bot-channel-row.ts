@@ -233,6 +233,31 @@ function killTree(pid: number): boolean {
   }
 }
 
+/** 解析真实 node.exe。宿主 process.execPath 是 Electron（跑 CJS app.js 可以，
+ *  跑 ESM index.mjs 直接退出），所以 SnowLuma 必须用真 node。解析顺序对齐
+ *  dsh.cmd shim：DSH_NODE（应用注入）→ `where node` → 常见安装路径。 */
+function resolveNodeExe(): string {
+  const candidates: string[] = [];
+  const dshNode = process.env.DSH_NODE;
+  if (dshNode) {
+    candidates.push(dshNode.startsWith("\\\\?\\") ? dshNode.slice(4) : dshNode);
+  }
+  try {
+    const res = spawnSync("where", ["node"], { windowsHide: true, encoding: "utf-8", timeout: 5_000 });
+    if (res.status === 0) {
+      const first = (res.stdout ?? "").split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+      if (first) candidates.push(first);
+    }
+  } catch {}
+  candidates.push("D:\\Program Files\\nodejs\\node.exe", "C:\\Program Files\\nodejs\\node.exe");
+  for (const p of candidates) {
+    try {
+      if (existsSync(p)) return p;
+    } catch {}
+  }
+  return process.execPath;
+}
+
 /** SnowLuma 托管配置（setting 表键 bot.channel.snowLuma.*，缺省兜底）。 */
 interface SnowLumaConfig {
   autoStart: boolean;
@@ -296,7 +321,8 @@ function startSnowLumaSupervisor(ctx: Context, cfg: SnowLumaConfig): { stop(): v
     }
     try {
       if (stopped) return;
-      const c = spawn(process.execPath, [SNOWLUMA_ENTRY], {
+      const nodeExe = resolveNodeExe();
+      const c = spawn(nodeExe, [SNOWLUMA_ENTRY], {
         cwd: cfg.dir,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
@@ -314,7 +340,7 @@ function startSnowLumaSupervisor(ctx: Context, cfg: SnowLumaConfig): { stop(): v
         ctx.logger?.warn?.(`[as-one] bot-channel: snowluma exited code=${code} signal=${signal}`);
         child = null;
       });
-      ctx.logger?.info?.(`[as-one] bot-channel: snowluma spawned pid=${c.pid} (${why})`);
+      ctx.logger?.info?.(`[as-one] bot-channel: snowluma spawned pid=${c.pid} via ${nodeExe} (${why})`);
     } catch (err) {
       ctx.logger?.warn?.(`[as-one] bot-channel: snowluma spawn failed (${why}):`, err);
     }
