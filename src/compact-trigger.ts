@@ -77,7 +77,14 @@ export function createCompactTrigger(
   };
 }
 
-/** 进程内单例:网关与插件入口共享同一份换档标记。 */
+/**
+ * 进程内单例:网关与插件入口共享同一份换档标记。
+ *
+ * ⚠️ 约束（review P3）：`activeHost` 活在本模块实例上，语义依赖「每进程
+ * 恰好一份」——host bundle 的 esbuild splitting 把共用模块收进共享 chunk
+ * （单实例），行之间共享没问题；**不要**复制本文件成第二份真源，否则两份
+ * 各记各的 host，一份拿到 {}、换档压缩静默失效。
+ */
 let activeHost: CompactTriggerHost = {};
 
 export function setCompactHost(host: CompactTriggerHost): void {

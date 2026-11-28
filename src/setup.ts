@@ -2,14 +2,15 @@
  * setupAsOne —— 纯函数装配(不依赖 ctx / DSH 服务,直接拿 dirs 参数)。
  *
  * 把「配置加载 + 凭据库 + DB 打开 + Scheduler/Router 构造 + resolveUpstream
- * 注入 + 模型列表」提炼成与 apps/electron/src/main/assembly.ts 相同接线顺序
- * 的组装,但**不建 http.Server、不开面板** —— 输出由 src/index.ts 的
- * ctx.webServer 路由消费。这样宿主半可被 vitest 冒烟测(不碰真实 DSH)。
+ * 注入 + 模型列表」提炼成组装,但**不建 http.Server、不开面板** —— 输出由
+ * src/index.ts 的 ctx.webServer 路由消费。这样宿主半可被 vitest 冒烟测
+ * (不碰真实 DSH)。
  *
- * ⚠️ **parity 纪律**:本文件是 electron `assembly.ts` 的镜像。装配顺序与注入
- * 的每一项都要对齐(会话粘性、重试策略、连接超时、思考强度能力表、逻辑模型
- * 输出上限、sensenova 账号池、请求日志/统计)。任何一侧改了接线,另一侧必须
- * 同步 —— 否则「同一个库,桌面版和插件版行为不一致」。
+ * 历史:本文件曾与 electron `assembly.ts` 做镜像 parity(装配顺序与注入对齐)。
+ * ⚠️ **electron 版已彻底废弃**,本文件是装配逻辑的**唯一实现**,不存在需对齐
+ * 的第二份接线,原先的 parity 同步纪律作废。装配顺序仍要保持内部自洽
+ * (会话粘性、重试策略、连接超时、思考强度能力表、逻辑模型输出上限、
+ * sensenova 账号池、请求日志/统计),改动只需关注本包。
  */
 
 import { mkdirSync } from "node:fs";
@@ -108,6 +109,17 @@ export interface AsOneRuntime {
   accountOverlay: Map<string, boolean>;
   /** 账号启停的唯一写口(更新缓存 + 落库)。 */
   setAccountEnabled(ref: string, enabled: boolean): void;
+  /**
+   * 渠道启停覆盖(用户 m11109 定案:每渠道一个子组件,设置页一个开关)。
+   * - 内存这份是读缓存,唯一真源是 `setting` 表逐键行 `channel.enabled.<provider>`;
+   * - 渠道行 apply 时经 `setChannelLive` 登记 live 源(`() => boolean` getter,
+   *   读 schemastery Volatile,免重启),优先于镜像。
+   */
+  channelOverlay: Map<string, boolean>;
+  /** 渠道启停的唯一写口(更新缓存 + 作废 live 源 + 落库)。 */
+  setChannelEnabled(provider: string, enabled: boolean): void;
+  /** live 源登记口:渠道行 apply 时注册 getter(行 → core 单向,R1 合规)。 */
+  setChannelLive(provider: string, live: unknown): void;
   /** `setting` 表只读口(面板设置页 / 重路由共用;每次现读)。 */
   getSetting(key: string): string | null;
   resolveUpstream: (model: string) => Upstream | undefined;
@@ -345,6 +357,75 @@ class LiveAccountOverlay extends Map<string, boolean> {
   }
 }
 
+/** 渠道覆盖的 setting 键前缀(`channel.enabled.<provider>`)。 */
+const CHANNEL_OVERLAY_PREFIX = "channel.enabled.";
+
+/**
+ * 渠道启停覆盖(用户 m11109 定案:每渠道一个子组件,设置页一个开关)。
+ *
+ * 与 {@link LiveAccountOverlay} 同构:内存 Map 只是同步读缓存,真源是
+ * `setting` 表的逐键行;跨实例一致靠 `PRAGMA data_version` 失效判断。
+ *
+ * 额外一层:**渠道行(子组件)装载后经 `setChannelLive` 登记的 live 源优先**
+ * —— schemastery Volatile 引用免重启,db 镜像是它的持久化影子。
+ */
+class LiveChannelOverlay extends Map<string, boolean> {
+  private version: number;
+
+  constructor(private readonly db: AsOneDatabase) {
+    super();
+    this.version = db.dataVersion();
+    this.reload();
+  }
+
+  /** 无条件重读逐键家族(构造期与「检测到别的实例提交」时调用)。 */
+  private reload(): void {
+    super.clear();
+    for (const row of this.db.setting.entries(CHANNEL_OVERLAY_PREFIX)) {
+      const provider = row.k.slice(CHANNEL_OVERLAY_PREFIX.length);
+      if (provider === "") continue;
+      super.set(provider, row.v === "1" || row.v === "true");
+    }
+    this.version = this.db.dataVersion();
+  }
+
+  /** 别的实例提交过就重读;自己实例的写入不改变 data_version,靠直接改内存。 */
+  private sync(): void {
+    let now: number;
+    try {
+      now = this.db.dataVersion();
+    } catch {
+      return; // 库已关闭(dispose 之后):保持最后一版快照
+    }
+    if (now !== this.version) this.reload();
+  }
+
+  override get(provider: string): boolean | undefined {
+    this.sync();
+    return super.get(provider);
+  }
+
+  override has(provider: string): boolean {
+    this.sync();
+    return super.has(provider);
+  }
+
+  override entries(): MapIterator<[string, boolean]> {
+    this.sync();
+    return super.entries();
+  }
+
+  override keys(): MapIterator<string> {
+    this.sync();
+    return super.keys();
+  }
+
+  override values(): MapIterator<boolean> {
+    this.sync();
+    return super.values();
+  }
+}
+
 function settingOf(db: AsOneDatabase, key: string): string | null {
   const row = db.setting.get(key);
   return row ? row.v : null;
@@ -419,6 +500,48 @@ export async function setupAsOne(options: SetupAsOneOptions): Promise<AsOneRunti
   // 1. DB 先开 —— 它是唯一真源(WAL + foreign_keys + SCHEMA_V7,缺失自动建)。
   const db = openDatabase(dbPath);
 
+  // 1.5 渠道启停覆盖(用户 m11109 定案:每渠道一个子组件,设置页一个开关)。
+  //     必须在 sensenova 池播种与 repo 装配**之前**建好 —— 两处都要按渠道过滤。
+  //     真源在 setting 表 `channel.enabled.<provider>` 逐键行;内存 Map 只是
+  //     同步读缓存(跨实例靠 PRAGMA data_version 失效判断)。
+  const channelOverlay = new LiveChannelOverlay(db);
+  /**
+   * live 源登记口:渠道行(子组件)apply 时注册 `() => boolean` getter。
+   * 行 → core 单向登记(R1 规则允许的方向),优先于 db 镜像 —— 免重启语义。
+   */
+  const channelLive = new Map<string, () => boolean>();
+  const setChannelLive = (provider: string, live: unknown): void => {
+    const fn = (live as { enabled?: unknown } | null)?.enabled;
+    if (typeof fn === "function") {
+      channelLive.set(provider, fn as () => boolean);
+    } else {
+      channelLive.delete(provider);
+    }
+  };
+  /** 渠道开关的唯一写口(更新缓存 + 作废 live 源 + 落库;面板拨动走这里)。 */
+  const setChannelEnabled = (provider: string, enabled: boolean): void => {
+    channelOverlay.set(provider, enabled);
+    channelLive.delete(provider); // 直写 db 时 live 源可能已过期,作废以 db 为准
+    try {
+      db.setting.set(`${CHANNEL_OVERLAY_PREFIX}${provider}`, enabled ? "1" : "0");
+    } catch (err) {
+      // 落库失败不影响本进程:这次拨动仍然生效,只是重启后回退。
+      console.error("[as-one] 渠道启停落库失败:", err);
+    }
+  };
+  /** 渠道是否启用:live 源(行装载) > setting 镜像 > 缺省启用。 */
+  const channelEnabledOf = (provider: string): boolean => {
+    const live = channelLive.get(provider);
+    if (live) {
+      try {
+        return live();
+      } catch {
+        /* live 读取失败回退镜像 */
+      }
+    }
+    return channelOverlay.get(provider) ?? true;
+  };
+
   // 2. 注册表 = 数据库在内存里的索引(provider / real_model / logical_model /
   //    scheduler.rules 全部来自表;JSON 已退化为导入/导出格式)。
   const registry = ProviderRegistry.fromSnapshot(snapshotFromDb(db).snapshot);
@@ -436,8 +559,11 @@ export async function setupAsOne(options: SetupAsOneOptions): Promise<AsOneRunti
   // 3. 凭据库(表后端;credential 表是唯一真源)。
   const vault = new CredentialVault(new DbCredentialBackend(db));
 
-  // 4. sensenova 账号池启动播种(凭据以库为唯一真源)。
-  await syncSensenovaPool(vault);
+  // 4. sensenova 账号池启动播种(凭据以库为唯一真源)。渠道关闭时跳过 ——
+  //    池空转只会占内存,关闭的渠道一个请求都不该路由给它。
+  if (channelEnabledOf("sensenova")) {
+    await syncSensenovaPool(vault);
+  }
 
   // 5. 密钥存在性探测:repo 只关心「有没有」,不碰明文。
   const secretPresence = new Map<string, boolean>();
@@ -468,6 +594,15 @@ export async function setupAsOne(options: SetupAsOneOptions): Promise<AsOneRunti
   const repo = new AppSchedulerRepo(db, registry, {
     hasSecret: (ref) => secretPresence.get(ref) ?? false,
     isAccountEnabled: (ref) => accountOverlay.get(ref) ?? (registry.getAccount(ref)?.enabled ?? false),
+    /**
+     * 渠道级总开关(用户 m11109 定案):渠道关闭 → 其下所有账号全部不进链。
+     * ref 形如 `provider/username`,provider 取第一段。
+     */
+    isChannelEnabled: (ref) => {
+      const slash = ref.indexOf("/");
+      const provider = slash === -1 ? ref : ref.slice(0, slash);
+      return channelEnabledOf(provider);
+    },
     // 运行期额度快照:与 electron 同一份投影(`@as-one/panel` 模块级 chQuotaCache)。
     // 没喂它 → due-first 的 `_expiryOf()` 两个来源全空 → 排序键并列 → 只能按
     // members 数组序,「到期早的先上」等于没生效(用户 m17562/m34799)。
@@ -686,11 +821,22 @@ export async function setupAsOne(options: SetupAsOneOptions): Promise<AsOneRunti
     keyProvider,
     accountOverlay,
     setAccountEnabled,
+    /**
+     * 渠道启停覆盖(用户 m11109 定案:每渠道一个子组件,设置页一个开关)。
+     * - 内存这份是读缓存,唯一真源是 `setting` 表逐键行 `channel.enabled.<provider>`;
+     * - 渠道行(子组件)apply 时经 `setChannelLive` 登记 live 源 —— 优先于镜像,
+     *   schemastery Volatile 免重启;db 镜像是它的持久化影子(跨实例一致)。
+     */
+    channelOverlay,
+    setChannelEnabled,
+    setChannelLive,
     getSetting: (key: string) => settingOf(db, key),
     secretPresence,
     subagentCapOf: (provider, model) => {
       // 真实模型:启用凭据数 × 该凭据并发(见 concurrency-defaults 的「每凭据」语义)。
       const realCap = (p: string, m: string): number => {
+        // 渠道关闭 → 容量 0(逻辑模型求和时该成员自然被跳过)。
+        if (!channelEnabledOf(p)) return 0;
         const creds = registry
           .listAccounts(p)
           .filter((a) => accountOverlay.get(a.credentialRef) ?? a.enabled).length;
@@ -714,7 +860,18 @@ export async function setupAsOne(options: SetupAsOneOptions): Promise<AsOneRunti
     },
     syncRegistry,
     resolveUpstream,
-    listModels: async () => listModelEntries(registry, db, await providersWithCredentials(registry, vault)),
+    /**
+     * /v1/models 清单:凭据在场 × **渠道启用**(用户 m11109 定案)。
+     * 渠道关闭后其真实模型不再出现在对外清单里 —— 选路也进不去,清单没意义。
+     */
+    listModels: async () => {
+      const withCreds = await providersWithCredentials(registry, vault);
+      const live = new Set<string>();
+      for (const p of withCreds) {
+        if (channelEnabledOf(p)) live.add(p);
+      }
+      return listModelEntries(registry, db, live);
+    },
     /**
      * 运行期单模型解析(**不过滤 hidden**)—— 与 GUI 清单分离。
      * 压缩组件直连隐藏成员(如 maas/spark-x2.6-4b)必须能解析,否则 404。

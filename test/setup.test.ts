@@ -13,9 +13,9 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "@as-one/core/src/db/database.js";
-import { chQuotaTableForScheduler } from "@as-one/panel/src/index.js";
+import { chQuotaTableForScheduler, dispatchPanel } from "@as-one/panel/src/index.js";
 import { setupAsOne } from "../src/setup.js";
-import { createPanelMethods } from "../src/panel-routes.js";
+import { createPanelMethods, PANEL_INTERNAL_METHODS } from "../src/panel-routes.js";
 import { createPanelHost } from "../src/panel-host.js";
 
 function makeTmpDir(): string {
@@ -210,6 +210,44 @@ describe("setupAsOne", () => {
     expect(rt.getSetting("route.compact")).toBeNull();
     rt.db.setting.set("route.compact", "free");
     expect(rt.getSetting("route.compact")).toBe("free");
+    rt.dispose();
+  });
+
+  it("面板路由覆盖守卫:每个可分发方法都落在共享 dispatchPanel 的已知分支", async () => {
+    const dir = makeTmpDir();
+    const rt = await setupAsOne({ dbPath: join(dir, "as-one.db"), env: {} });
+
+    // 路由面按面板对象的**实际方法键**建（panel-routes.ts），排除内部方法后
+    // 剩下的每个键都必须能被共享 dispatchPanel 分发 —— 否则该路由等于空响应
+    // （default 返回「未知面板方法」），用户点开页面才发现。共享包往 Panel
+    // 对象上加方法时，这个断言逼你做「可分发还是内部」的决定。
+    const panel = createPanelMethods(rt, { gatewayPort: 4000 });
+    const record = panel as unknown as Record<string, unknown>;
+    const methods = Object.keys(record).filter((name) => typeof record[name] === "function");
+    expect(methods.length).toBeGreaterThan(0);
+
+    const internal = new Set<string>(PANEL_INTERNAL_METHODS);
+    const unroutable: string[] = [];
+    const unknown: string[] = await Promise.all(
+      methods.map(async (method) => {
+        if (internal.has(method)) return null; // 内部缓存读口,本就不该有路由
+        if (method === "restartGateway") return null; // 插件专有,路由层特判
+        try {
+          const result = await dispatchPanel(panel as Parameters<typeof dispatchPanel>[0], method, []);
+          // 只判定 default 分支的签名:{ ok: false, message: "未知面板方法" }。
+          // 缺参导致的受控报错算「case 存在」,不是覆盖缺口。
+          const message =
+            typeof result === "object" && result !== null && (result as { message?: unknown }).message;
+          return message === "未知面板方法" ? method : null;
+        } catch {
+          return null;
+        }
+      }),
+    ).then((found) => found.filter((x): x is string => x !== null));
+    unknown.forEach((method) => unroutable.push(method));
+
+    expect(unroutable).toEqual([]);
+
     rt.dispose();
   });
 });

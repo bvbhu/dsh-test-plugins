@@ -1225,8 +1225,9 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
           if (overflow) {
             throw new UpstreamError(
               UpstreamErrorKind.BadRequest,
-              `请求超出模型上下文窗口(本次请求 ${sentPromptTokens} tokens,已自动压缩 ` +
-                `${contextShrinks} 次仍被拒)。请执行 /compact 或新建会话再试。上游原文:${gerr.detail}`,
+              `请求超出模型上下文窗口(本次请求 ${sentPromptTokens} tokens,` +
+                `${contextShrinks > 0 ? `已自动压缩 ${contextShrinks} 次仍被拒` : `未自动压缩（自动压缩已关闭）`}。` +
+                `请执行 /compact 或新建会话再试。上游原文:${gerr.detail}`,
               { statusCode: httpStatusOf(gerr) },
             );
           }
@@ -1679,8 +1680,9 @@ export function buildResolveUpstream(runtime: UpstreamRuntime): (model: string) 
             if (overflow) {
               throw new UpstreamError(
                 UpstreamErrorKind.BadRequest,
-                `请求超出模型上下文窗口(本次请求 ${sentPromptTokens} tokens,已自动压缩 ` +
-                  `${contextShrinks} 次仍被拒)。请执行 /compact 或新建会话再试。上游原文:${gerr.detail}`,
+                `请求超出模型上下文窗口(本次请求 ${sentPromptTokens} tokens,` +
+                  `${contextShrinks > 0 ? `已自动压缩 ${contextShrinks} 次仍被拒` : `未自动压缩（自动压缩已关闭）`}。` +
+                  `请执行 /compact 或新建会话再试。上游原文:${gerr.detail}`,
                 { statusCode: httpStatusOf(gerr) },
               );
             }

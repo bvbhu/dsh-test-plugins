@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "Shared runtime for the As One plugin line; load this component first."
+  }
+}

@@ -27,7 +27,7 @@
  *    (实测:带键 400、去键成功),但**网关拿它可以做端点亲和**:
  *    同一前缀 → 同一推理节点 → 上游前缀缓存命中。所以它进 `consume`。
  * 2. **`reasoning_effort` 只原样透传**。网关不解释它、不改写它;上游说不支持,
- *    就丢掉重试一次(见 `apps/electron/src/main/gateway-upstream.ts` 的
+ *    就丢掉重试一次(见 `src/gateway-upstream-errors.ts` 的
  *    `isReasoningEffortRejection`)。**未指定时不添加** —— 让上游自己决定。
  *    唯一例外是「图像和长上下文拓展」这类网关内部的辅助调用:它们未指定时必须
  *    显式 `reasoning_effort: "none"`(开着思考会把输出预算烧在推理上)。

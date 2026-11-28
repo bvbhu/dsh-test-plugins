@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "OpenAI 兼容网关面（/v1/models、/v1/chat/completions、/v1/messages）。"
+  }
+}

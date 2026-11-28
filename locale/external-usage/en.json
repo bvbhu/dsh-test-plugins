@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "Collects non-gateway usage into stats_external_daily."
+  }
+}

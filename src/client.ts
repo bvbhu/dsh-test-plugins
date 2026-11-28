@@ -9,6 +9,7 @@
  */
 
 import { bindPanelBridge } from "./client/api.js";
+import { startChimePoller } from "./client/chime.js";
 import { injectAsOneStyles } from "./client/styles.js";
 
 import type { Context } from "./client/context.js";
@@ -36,6 +37,10 @@ export function apply(ctx: Context, _config: Record<string, unknown> = {}): void
   ctx.effect(() => ctx.locale.register(LOCALE_NS, "zh", zh));
   ctx.effect(() => ctx.locale.register(LOCALE_NS, "en", en));
   const t = ctx.locale.bind(LOCALE_NS);
+
+  // ── 提示音轮询(dsh-chime 合并)──────────────────────────────
+  // bot-notify 行(host 半)发通知时入队音效,这里每 250ms 取走播放。
+  ctx.effect(startChimePoller, "as-one chime poller");
 
   // ── 侧栏行 + 主面板 ─────────────────────────────────────────
   ctx.effect(() =>

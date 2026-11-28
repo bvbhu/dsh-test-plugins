@@ -168,11 +168,26 @@ function collapsedBatchError(headline: string, attempts: unknown[]): Error {
   return error;
 }
 
+/** 一条路由的真实容量（上下文窗口 / 输出上限，token）。 */
+export interface RouteCapacity {
+  contextWindow: number;
+  maxTokens: number;
+}
+
 export interface ChainContext {
   llm: {
     stream(options: DshGenerateLike): AsyncIterable<Record<string, unknown> & { type?: string; text?: string; block?: { type?: string; text?: string }; usage?: unknown; reason?: { kind?: string; failure?: { message?: string; code?: string; providerRetryAfterMs?: number } } }>;
     providerRetryPolicy?: (provider: string) => unknown;
   };
+  /**
+   * 真实容量真值口（2026-11 改进）。
+   *
+   * 调用方没有显式传 `capacities` 时，`resolveCapacities` **逐条路由**问它，
+   * 不再一律用 `DEFAULT_CONTEXT_WINDOW` 的保守默认：小窗口模型被当成「装得下」
+   * 只会在上游吃 400，切分重试只是事后补救。查不到（未注入 / 无该模型）返回
+   * `null` → 退回默认值（与旧行为一致，不构成硬依赖）。
+   */
+  capacityOf?: (provider: string, model: string) => RouteCapacity | null;
   /** as-one 适配：调用前翻译 provider/model（见 as-one-call.ts）。 */
   asOneCall?: boolean;
   asOneProvider?: string;
@@ -208,6 +223,34 @@ export interface ChainAgent {
 function capacityUsage(capacity: CapacityView | undefined, model: QuiltPoolModel): number {
   if (!capacity) return 0;
   return capacity.usage(model.provider, model.model);
+}
+
+/**
+ * 每条路由的容量表：注入口给真值，缺失/非法用保守默认。
+ *
+ * 独立成纯函数（run 里只做装配）：容量判断是「模型装不装得下这段历史」的
+ * 唯一依据，窗口报大会让调用以 400 收场、报小会白白多切一刀 —— 两条都值得
+ * 被单测直接盯住。
+ */
+export function resolveRouteCapacities(
+  routes: Iterable<{ key?: string; provider: string; model: string }>,
+  capacityOf?: (provider: string, model: string) => RouteCapacity | null,
+): Map<string, RouteCapacity> {
+  const capacities = new Map<string, RouteCapacity>();
+  for (const route of routes) {
+    const live = capacityOf?.(route.provider, route.model) ?? null;
+    const contextWindow =
+      live !== null && Number.isInteger(live.contextWindow) && live.contextWindow > 0
+        ? live.contextWindow
+        : DEFAULT_CONTEXT_WINDOW;
+    const maxTokens =
+      live !== null && Number.isInteger(live.maxTokens) && live.maxTokens > 0
+        ? live.maxTokens
+        : DEFAULT_MAX_TOKENS;
+    const key = typeof route.key === "string" && route.key !== "" ? route.key : `${route.provider}/${route.model}`;
+    capacities.set(key, { contextWindow, maxTokens });
+  }
+  return capacities;
 }
 
 export class ModelChain {
@@ -658,15 +701,12 @@ export class ModelChain {
 
   private async resolveCapacities(signal?: AbortSignal): Promise<Map<string, { contextWindow: number; maxTokens: number }>> {
     if (this.capacities !== undefined) return this.capacities;
-    this._capacitiesPromise ??= (async () => {
-      const capacities = new Map<string, { contextWindow: number; maxTokens: number }>();
-      for (const [key] of this.routes) {
-        // 没有 ctx.llm.resolveModelInfo 的鸭子类型保障：保守用默认窗口。
-        capacities.set(key, { contextWindow: DEFAULT_CONTEXT_WINDOW, maxTokens: DEFAULT_MAX_TOKENS });
-      }
-      void signal;
-      return capacities;
-    })();
+    // 2026-11 改进：默认值只兜底，真值优先问 ctx.capacityOf（as-one 装配层用
+    // registry.getRealModel 的 maxInputTokens/maxOutputTokens 注入）。
+    this._capacitiesPromise ??= Promise.resolve(
+      resolveRouteCapacities(this.routes.values(), this.ctx.capacityOf),
+    );
+    void signal;
     return this._capacitiesPromise;
   }
 

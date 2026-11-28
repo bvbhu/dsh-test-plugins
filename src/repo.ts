@@ -27,6 +27,11 @@ export interface RepoEnv {
   /** 面板覆盖后的启用态(config enabled × overlay),未覆盖时读 config。 */
   isAccountEnabled(credentialRef: string): boolean;
   /**
+   * 渠道级总开关(用户 m11109 定案:每渠道一个子组件,设置页一个开关)。
+   * 渠道关闭 → 其下所有账号全部不进链(在 `#rowsFor` 里按 provider 短路)。
+   */
+  isChannelEnabled(credentialRef: string): boolean;
+  /**
    * 运行期额度快照(按 "provider/username" 索引),来自刷新/探针缓存。
    *
    * ⚠️ **due-first 的到期时间就靠它**(用户 m17562):trae / workbuddy 的
@@ -155,6 +160,8 @@ export class AppSchedulerRepo implements SchedulerRepo {
     const maxOutputTokens = dbRow?.max_output_tokens ?? intOr(rdef.maxOutputTokens, 0);
 
     const rows: RawEndpointRow[] = [];
+    // 渠道级总开关(用户 m11109):渠道关闭 → 整渠道短路,连账号循环都不进。
+    if (!this.env.isChannelEnabled(provider)) return rows;
     for (const account of this.registry.listAccounts(provider)) {
       const credentialRef = account.credentialRef;
       if (!this.env.hasSecret(credentialRef) || !this.env.isAccountEnabled(credentialRef)) continue;

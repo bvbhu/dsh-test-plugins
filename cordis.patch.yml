@@ -1,3 +1,45 @@
 - insert:
+    - id: as-one-core
+      name: '@bvbhu/as-one/core'
+    # 渠道子组件组（用户 m11109：Trae / WorkBuddy / SenseNova / MiniMax /
+    # Qoder / CodeArts 每渠道一个子组件，DSH 设置页一个 enabled 开关）。
+    # inject asOneCore → 必须在核心行之后；行 apply 向 runtime 登记 live 源。
+    - id: as-one-channel-trae
+      name: '@bvbhu/as-one/channel-trae'
+    - id: as-one-channel-workbuddy
+      name: '@bvbhu/as-one/channel-workbuddy'
+    - id: as-one-channel-sensenova
+      name: '@bvbhu/as-one/channel-sensenova'
+    - id: as-one-channel-minimax
+      name: '@bvbhu/as-one/channel-minimax'
+    - id: as-one-channel-qoder
+      name: '@bvbhu/as-one/channel-qoder'
+    - id: as-one-channel-codearts
+      name: '@bvbhu/as-one/channel-codearts'
     - id: as-one-gateway
       name: '@bvbhu/as-one'
+    - id: as-one-subagent
+      name: '@bvbhu/as-one/subagent'
+    - id: as-one-external-port
+      name: '@bvbhu/as-one/external-port'
+    - id: as-one-external-usage
+      name: '@bvbhu/as-one/external-usage'
+    # settings 行：bot.mhy.* live 配置（DSH 设置页可编辑），须在 bot 组前装载。
+    - id: as-one-settings
+      name: '@bvbhu/as-one/settings'
+    # bot 组：通道先行（chat/assistant/notify 都 inject asOneBotChannel），
+    # mhy 不依赖通道可独立加载。
+    - id: as-one-bot-channel
+      name: '@bvbhu/as-one/bot-channel'
+    - id: as-one-bot-mhy
+      name: '@bvbhu/as-one/bot-mhy'
+    - id: as-one-bot-chat
+      name: '@bvbhu/as-one/bot-chat'
+    - id: as-one-bot-assistant
+      name: '@bvbhu/as-one/bot-assistant'
+    # bot-session-tools 不再全局挂载（2026-11-28 用户定案）：
+    # search_sessions / deliver_message / send_to_session / read_session /
+    # qq_recent_history 只允许在 preset-chat 与 preset-assistant 的
+    # plugins 列表里注册，其他预设根本看不到这些工具，不依赖任何禁用插件。
+    - id: as-one-bot-notify
+      name: '@bvbhu/as-one/bot-notify'
