@@ -50,11 +50,10 @@ import {
 import {
   BILLABLE_WINDOW_S,
   COOLDOWN_ON_HOLD,
+  MAX_HOLD_DELAY_S,
   SensenovaAccountPool,
   SensenovaAccountRuntime,
-  TRANSIENT_WAIT_ROUNDS_LIMIT,
   WINDOW_RETRY_BACKOFF_S,
-  WINDOWED_WAIT_ROUNDS_LIMIT,
   pinnedPostJson,
   sensenovaKeyFingerprint,
   sensenovaSnippet,
@@ -108,11 +107,10 @@ export {
   COOLDOWN_ON_HOLD,
   HEALTH_WINDOW_S,
   LOG_LOW_TPM_THRESHOLD,
+  MAX_HOLD_DELAY_S,
   SensenovaAccountPool,
   SensenovaAccountRuntime,
-  TRANSIENT_WAIT_ROUNDS_LIMIT,
   WINDOW_RETRY_BACKOFF_S,
-  WINDOWED_WAIT_ROUNDS_LIMIT,
   pinnedPostJson,
   sensenovaKeyFingerprint,
   sensenovaSnippet,
@@ -126,18 +124,17 @@ export type {
 // ---------------------------------------------------------------------------
 
 /**
- * 429 归因 → 下次重试前的等待秒数(受剩余预算 clamp)。
+ * 429 归因 → 下次重试前的等待秒数(受单次/剩余预算 clamp)。
  *
- * 2026-11-28 第二次调整(用户:「上游繁忙也报 429 tpm 限制 —— 重试节奏要
- * 加快」):上游**繁忙**与我们自己的窗口耗尽回的是同样的 tpm/rpm 429,
- * 文案分不出来。等满整窗(60s)对繁忙型太慢、对自耗型又不必要,于是窗口型
- * 改走**递增退避**({@link WINDOW_RETRY_BACKOFF_S}):繁忙型第 1-2 次重试
- * 只隔 5-10s;自耗型累计 75s 已越过一个完整计费窗口,窗口自然滑走。
- * 瞬时型(归因未知)保持短间隔 COOLDOWN_ON_HOLD。
+ * 用户定案 2026-11-28(m15681):「重试总时长按设置项请求总超时时间 600(秒),
+ * 等待时间最长 10s(每分钟 6 次而已)」。窗口型走快节奏递增退避
+ * ({@link WINDOW_RETRY_BACKOFF_S} = [5,10],末位停在 10s),瞬时型保持
+ * COOLDOWN_ON_HOLD=5s。无论哪种,单次等待都硬顶 {@link MAX_HOLD_DELAY_S}=10s,
+ * 总时长由设置项 `real.wait_budget_s` 驱动的外层 signal 控制 —— 不再设轮数上限。
  *
- * 返回 `Math.min(step, waitLeft)`:预算只剩一半时等一半,预算耗尽返回 0
- * (调用方重置预算继续等同一个号,不 sleep;唯一终止条件是轮数上限/外层
- * signal)。
+ * 返回 `Math.max(0, Math.min(step, MAX_HOLD_DELAY_S, waitLeft))`:预算只剩
+ * 一半时等一半,预算耗尽返回 0(调用方重置预算继续等同一个号,不 sleep;
+ * 唯一终止条件是外层 signal)。
  *
  * @param rawBody 429 的原始响应体(归因只认它,空串按瞬时型处理)。
  * @param waitLeft 本轮剩余的同号等待预算(秒)。
@@ -153,7 +150,7 @@ export function holdDelaySeconds(
   const step = windowed
     ? WINDOW_RETRY_BACKOFF_S[Math.min(windowedRounds, WINDOW_RETRY_BACKOFF_S.length - 1)]
     : COOLDOWN_ON_HOLD;
-  return Math.max(0, Math.min(step, waitLeft));
+  return Math.max(0, Math.min(step, MAX_HOLD_DELAY_S, waitLeft));
 }
 
 /**
@@ -188,15 +185,15 @@ export const MAX_TRANSIENT_400_RETRIES = 3;
  * ## 账号调度:单账号,粘性绑**真实模型**级(用户 m23215 定案:绝不换号)
  *
  * 429 时**不换号**,同号同模型继续请求;等待按**轮**推进:
- * 1. 429 → **同号硬等**:窗口型限流(tpm/rpm,60s 滑动)走**递增退避**
- *    (5/10/20/40s,累计越过一个完整计费窗口 —— 上游繁忙与自耗同码,
- *    短打快成功、长等让窗口滑走),瞬时型保持 COOLDOWN_ON_HOLD;
- * 2. **轮数有界,超限交回错误码**(2026-11-28 用户定案,推翻「耗尽不再算
- *    错误」):「不要无意义等待 —— 要么持续重试到成功,要么把错误码交回去」。
- *    轮数有上限(窗口型
- *    {@link WINDOWED_WAIT_ROUNDS_LIMIT} 轮 / 瞬时型 {@link TRANSIENT_WAIT_ROUNDS_LIMIT}
- *    轮):超限立刻交回**上一次的真实 429**,让外层退避重试或换档,而不是
- *    在外层 600s 预算里空转到超时;
+ * 1. 429 → **同号硬等**:窗口型限流(tpm/rpm,60s 滑动)走**快节奏递增退避**
+ *    ({@link WINDOW_RETRY_BACKOFF_S} = [5,10]s,末位停在 10s —— 上游繁忙与
+ *    自耗同码,5-10s 每分 ≤6 次,窗口自然滑走),瞬时型保持 COOLDOWN_ON_HOLD;
+ *    单次等待硬顶 {@link MAX_HOLD_DELAY_S}=10s(用户 m15681 定案);
+ * 2. **总时长由设置项控制**:不再设轮数上限。设置项 `real.wait_budget_s`
+ *    (请求总超时时间,默认 60s / 用户设 600s)驱动外层 signal —— 外层
+ *    `armConnectTimeout` 在 `runSensenova` 之前 armed、返回之后才 clear,
+ *    确实覆盖连接器内部 429 循环;撑满预算 abort 后交回**上一次的真实 429**。
+ *    这样既不会「轮数用尽后空转到超时」,也不会「重置预算无限等」;
  * 3. **会话粘性由 Router 的 session pin 负责**(`scheduler.pin_seconds`),粘的是
  *    **真实模型**;
  * 4. 单账号单并发(`inflight` 标记)+ 一条钉连接 —— 前缀缓存按 1024-token 块
@@ -428,14 +425,14 @@ export class SensenovaAdapter implements AuthConnector {
    *
    * 账号策略(用户 m23215 定案:**单账号,绝不换号**):
    * - 粘性绑定在真实模型一级;429 时**不换号**,同号同模型继续请求;
-   * - 429 同号硬等:窗口型限流(tpm/rpm,60s 滑动)等满一个完整计费窗口再打
-   *   (每 5s 刷一次会把窗口永远顶在「刚打过」,实测短间隔反而持续 429),
-   *   瞬时型保持 COOLDOWN_ON_HOLD 短间隔(见 {@link holdDelaySeconds});
-   * - **轮数有界,超限交回错误码**(2026-11-28 用户定案):等满窗口是必要
-   *   等待,但轮数有上限(窗口型 {@link WINDOWED_WAIT_ROUNDS_LIMIT} /
-   *   瞬时型 {@link TRANSIENT_WAIT_ROUNDS_LIMIT})—— 超限立刻交回**上一次
-   *   的真实 429**,让外层退避重试或换档,而不是在外层 600s 预算里空转到
-   *   超时(「不要无意义等待:要么持续重试到成功,要么把错误码交回去」);
+   * - 429 同号硬等:窗口型限流(tpm/rpm,60s 滑动)走**快节奏递增退避**
+   *   ({@link WINDOW_RETRY_BACKOFF_S} = [5,10]s,末位停在 10s —— 上游繁忙
+   *   与自耗同码,5-10s 每分 ≤6 次,窗口自然滑走),瞬时型保持
+   *   COOLDOWN_ON_HOLD 短间隔;单次等待硬顶 {@link MAX_HOLD_DELAY_S}=10s;
+   * - **总时长由设置项控制,不设轮数上限**:设置项 `real.wait_budget_s`
+   *   (请求总超时时间,默认 60s / 用户设 600s)驱动外层 signal;撑满预算
+   *   abort 后交回**上一次的真实 429**(「不要无意义等待:要么持续重试到
+   *   成功,要么把错误码交回去」);
    * - **例外**:`isTransientInvalidParameter()` 认出的 400 是上游限流期的
    *   伪 400(见该函数注释),按 429 同号短等待重试,有独立次数上限;
    * - 非 429 的其它错误(401/403/普通 400)直接抛:凭据/请求问题,等也没用。
@@ -448,19 +445,17 @@ export class SensenovaAdapter implements AuthConnector {
     model: string,
     creds: ConnectorCredentials,
     signal?: AbortSignal,
-    /** 单轮等待预算(秒):窗口型 60s / 瞬时型 5s。默认一个完整计费窗口;测试传 0 跳过真实等待。 */
+    /** 单轮等待预算(秒):默认一个完整计费窗口;测试传 0 跳过真实等待。总时长以 signal 为准。 */
     waitBudgetSeconds: number = BILLABLE_WINDOW_S,
   ): Promise<{ res: Response; runtime: SensenovaAccountRuntime }> {
     const rt = this.acquireFor(creds);
     let waitLeft = Math.max(0, waitBudgetSeconds);
     let waitedS = 0;
-    /** 窗口型 429 已消耗的同号等待轮数(上限 {@link WINDOWED_WAIT_ROUNDS_LIMIT})。 */
+    /** 窗口型 429 已发生的同号等待次数(取退避表下标,末位停在 10s)。 */
     let windowedRounds = 0;
-    /** 瞬时型 429 已消耗的同号等待轮数(上限 {@link TRANSIENT_WAIT_ROUNDS_LIMIT})。 */
-    let transientRounds = 0;
     /** 伪 400 已重试次数(独立于 429 等待预算,避免一条错误吃掉 100s)。 */
     let transient400Retries = 0;
-    /** 最近一次真实上游错误:总预算耗尽 / 轮数超限时优先把它交还给调用方。 */
+    /** 最近一次真实上游错误:总预算耗尽时优先把它交还给调用方。 */
     let lastError: Error | undefined;
     try {
       for (;;) {
@@ -507,34 +502,28 @@ export class SensenovaAdapter implements AuthConnector {
         if (res.status !== 429) throw err; // 非限流:401/403/普通 400 是凭据/请求问题,换号也无用
 
         const now = Date.now();
-        // 记住这次真实错误 —— 轮数超限 / 总预算耗尽时优先交还它（用户定案：
+        // 记住这次真实错误 —— 总预算耗尽时优先交还它（用户定案：
         // 「返回上一次的报错信息，没有才返回超时」）。
         lastError = err;
 
         // 429：**同号同模型继续请求**（用户 2026-11-18 定案：不换号）。
-        // 先按归因分轮计数：窗口型走递增退避（上游繁忙与自耗同码，5/10/20/40s，
-        // 累计越过一个计费窗口），瞬时型短间隔；轮数超限立刻交回真实 429，
-        // 不 sleep、不空耗。
+        // 窗口型走快节奏递增退避（上游繁忙与自耗同码，[5,10]s 末位停在 10s，
+        // 每分 ≤6 次让窗口自然滑走），瞬时型保持 COOLDOWN_ON_HOLD 短间隔。
+        // 不再设轮数上限 —— 总时长由设置项 `real.wait_budget_s` 驱动的外层
+        // signal 控制：撑满预算 abort 时把 lastError（真实 429）交回去。
         const windowed =
           classify_rate_limit(text || "") === ATTR_RPM ||
           classify_rate_limit(text || "") === ATTR_SHARED;
-        if (windowed) {
-          windowedRounds += 1;
-          if (windowedRounds > WINDOWED_WAIT_ROUNDS_LIMIT) throw err;
-        } else {
-          transientRounds += 1;
-          if (transientRounds > TRANSIENT_WAIT_ROUNDS_LIMIT) throw err;
-        }
-        // 一轮节奏窗口用尽:重置计时接着等同一个号。
+        if (windowed) windowedRounds += 1;
+        // 一轮节奏窗口用尽:重置计时接着等同一个号(外层 signal 是唯一终止)。
         if (waitLeft <= 0) {
           rt.coolAccountFor(BILLABLE_WINDOW_S, sensenovaSnippet(text), now);
           waitLeft = Math.max(0, waitBudgetSeconds);
           waitedS = 0;
         }
-        // 同号硬等:窗口型限流(tpm/rpm)按**递增退避**节奏重试 —— 上游繁忙
-        // 与我们自己的窗口耗尽回同一码,5/10/20/40s 让繁忙型快成功、自耗型
-        // 累计 75s 越过一个完整窗口(见 holdDelaySeconds / WINDOW_RETRY_BACKOFF_S);
-        // 瞬时型 429 保持 COOLDOWN_ON_HOLD 短间隔。
+        // 同号硬等:窗口型按递增退避 [5,10]s 快节奏重试(见 holdDelaySeconds /
+        // WINDOW_RETRY_BACKOFF_S),瞬时型保持 COOLDOWN_ON_HOLD 短间隔;单次
+        // 等待硬顶 MAX_HOLD_DELAY_S=10s。
         const delay = holdDelaySeconds(text, waitLeft, windowed ? windowedRounds - 1 : 0);
         rt.coolFor(delay, sensenovaSnippet(text), model, now);
         await this.sleep(delay * 1000, signal);

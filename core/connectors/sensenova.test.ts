@@ -236,24 +236,23 @@ describe("classify_rate_limit", () => {
 });
 
 // ---------------------------------------------------------------------------
-// holdDelaySeconds —— 窗口型递增退避 / 瞬时型短间隔
+// holdDelaySeconds —— 窗口型快节奏递增退避 / 单次硬顶 10s / 瞬时型短间隔
 // ---------------------------------------------------------------------------
 
 describe("holdDelaySeconds", () => {
-  it("窗口型(ATTR_RPM/ATTR_SHARED)→ 按轮递增退避 5/10/20/40s", () => {
+  it("窗口型(ATTR_RPM/ATTR_SHARED)→ 递增退避 5/10s，末位停在 10s（≤ MAX_HOLD_DELAY_S）", () => {
     expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 0)).toBe(5);
     expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 1)).toBe(10);
-    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 2)).toBe(20);
-    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 3)).toBe(40);
-    // 超过表长 → 停在末位 40s(累计 75s 已越过一个完整计费窗口)
-    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 9)).toBe(40);
+    // 超过表长 → 停在末位 10s（每分钟 ≤6 次，用户 m15681 定案）
+    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 2)).toBe(10);
+    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 100, 9)).toBe(10);
     expect(holdDelaySeconds('{"code":8,"message":"rpm exhausted"}', 100, 0)).toBe(5);
     expect(holdDelaySeconds("tpm/rpm limit exceeded", 100, 1)).toBe(10);
-    expect(holdDelaySeconds('{"code":429003,"message":"shared"}', 100, 2)).toBe(20);
+    expect(holdDelaySeconds('{"code":429003,"message":"shared"}', 100, 9)).toBe(10);
   });
 
-  it("窗口型但预算不足 → 预算截断(等 `Math.min(退避步长, waitLeft)`)", () => {
-    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 3, 3)).toBe(3);
+  it("窗口型但预算不足 → 预算截断(等 `Math.min(退避步长, MAX_HOLD_DELAY_S, waitLeft)`)", () => {
+    expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 3, 0)).toBe(3);
     expect(holdDelaySeconds('{"code":8,"message":"tpm exhausted"}', 0, 0)).toBe(0);
   });
 
@@ -471,10 +470,10 @@ describe("SensenovaAdapter", () => {
     expect(seen).toEqual(["Bearer ka", "Bearer ka", "Bearer ka"]); // 全程同一个号
   });
 
-  it("窗口型 429:轮数上限内继续请求,超限立刻交回真实 429（不空耗到外层 signal）", async () => {
-    // 2026-11-28 用户定案(推翻「耗尽不再算错误」):「不要无意义等待 ——
-    // 要么持续重试到成功,要么把错误码交回去」。等满窗口是必要等待,但轮数
-    // 有上限:窗口型 5 轮,超限交回**上游原文**,让外层退避重试或换档。
+  it("窗口型 429:不设轮数上限，signal abort 后交回真实 429（总时长由设置项控制）", async () => {
+    // 用户定案 m15681:「重试总时长按设置项请求总超时时间 600(秒),等待时间
+    // 最长 10s」。不再设轮数上限 —— 总时长由外层 signal(设置项驱动)唯一
+    // 控制;撑满预算 abort 后交回**上游原文**真实 429。
     let calls = 0;
     const fetchFn = (async () => {
       calls += 1;
@@ -483,7 +482,8 @@ describe("SensenovaAdapter", () => {
       });
     }) as unknown as typeof fetch;
     const adapter = new SensenovaAdapter([{ username: "a", api_key: "ka" }], fetchFn);
-    // **不给 signal**:证明终止靠轮数上限,不是外层总预算。
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 30);
     let err: unknown;
     try {
       await adapter.runWithAccount(
@@ -491,8 +491,8 @@ describe("SensenovaAdapter", () => {
         {},
         "m1",
         { apiKey: "ka" },
-        undefined,
-        0.02, // 节奏窗口 20ms:6 轮 × 20ms 内必然耗尽
+        ac.signal,
+        0.01, // 单轮预算 10ms，快速进入等待 → abort 打断
       );
     } catch (e) {
       err = e;
@@ -504,11 +504,11 @@ describe("SensenovaAdapter", () => {
     expect(e.message).toContain("rpm exhausted");
     expect(e.message).not.toContain("池内已无可换");
     expect(e.message).not.toContain("总超时预算耗尽");
-    // 5 轮等待 + 第 6 次 429 触发超限 → 恰好 6 次调用,没有第 7 次。
-    expect(calls).toBe(6);
+    // abort 打断等待:至少重试过一次(证明无轮数上限时仍在继续同号等待)。
+    expect(calls).toBeGreaterThanOrEqual(2);
   });
 
-  it("瞬时型 429:短间隔重试到轮数上限后交回真实 429", async () => {
+  it("瞬时型 429:不设轮数上限，signal abort 后交回真实 429", async () => {
     let calls = 0;
     const fetchFn = (async () => {
       calls += 1;
@@ -518,6 +518,8 @@ describe("SensenovaAdapter", () => {
       });
     }) as unknown as typeof fetch;
     const adapter = new SensenovaAdapter([{ username: "a", api_key: "ka" }], fetchFn);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 30);
     let err: unknown;
     try {
       await adapter.runWithAccount(
@@ -525,7 +527,7 @@ describe("SensenovaAdapter", () => {
         {},
         "m1",
         { apiKey: "ka" },
-        undefined,
+        ac.signal,
         0.01,
       );
     } catch (e) {
@@ -534,8 +536,7 @@ describe("SensenovaAdapter", () => {
     const e = err as UpstreamError;
     expect(e).toBeInstanceOf(UpstreamError);
     expect(e.message).toContain("rate limited");
-    // 瞬时型 12 轮:第 13 次 429 触发超限。
-    expect(calls).toBe(13);
+    expect(calls).toBeGreaterThanOrEqual(2);
   });
 
   it("一次真实错误都没拿到时，总预算耗尽报 timeout", async () => {
