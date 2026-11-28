@@ -23,9 +23,10 @@ import { spawn, spawnSync } from "node:child_process";
 import { connect as netConnect } from "node:net";
 import { existsSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
-import { WebSocket } from "ws";
+import type { Socket } from "node:net";
 import type { Context } from "./context-types.js";
 import type { AsOneCoreService } from "./core-service.js";
+import { MiniWebSocket } from "./bot-ws-client.js";
 import { normalizeHistoryMessages } from "./bot-history.js";
 import type {
   AsOneBotChannelService,
@@ -69,7 +70,7 @@ const SNOWLUMA_PROBE_TIMEOUT_MS = 2_000;
 /** 重连退避：首delay 500ms，指数增长，上限 30s。 */
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
-/** WS 客户端统一走 ws 包：宿主 Electron 的 Node 无 globalThis.WebSocket。 */
+/** WS 客户端走零依赖 MiniWebSocket（src/bot-ws-client.ts）：宿主 Electron 的 Node 无 globalThis.WebSocket，且引 ws 包会让 esbuild 产物带 __require shim、ESM 加载即炸。 */
 type SocketLike = {
   readyState: number;
   send(data: string): void;
@@ -641,10 +642,10 @@ export function apply(ctx: Context): void {
       const connect = () => {
         if (disposed) return;
         reconnectTimer = null;
-        const ws = new WebSocket(snowLumaWsUrl);
+        const ws = new MiniWebSocket(snowLumaWsUrl);
         socket = ws;
         ws.on("open", onOpen);
-        ws.on("message", (data) => onMessage({ data: data.toString() }));
+        ws.on("message", (m) => onMessage({ data: (m as { data: string }).data }));
         ws.on("close", onClose);
         ws.on("error", onError);
       };
