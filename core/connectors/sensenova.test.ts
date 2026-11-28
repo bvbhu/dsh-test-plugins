@@ -466,7 +466,10 @@ describe("SensenovaAdapter", () => {
     expect(seen).toEqual(["Bearer ka", "Bearer ka", "Bearer ka"]); // 全程同一个号
   });
 
-  it("同号节奏窗口耗尽后**继续**请求，不抛错；只有外层 signal 能终止（总预算）", async () => {
+  it("窗口型 429:轮数上限内继续请求,超限立刻交回真实 429（不空耗到外层 signal）", async () => {
+    // 2026-11-28 用户定案(推翻「耗尽不再算错误」):「不要无意义等待 ——
+    // 要么持续重试到成功,要么把错误码交回去」。等满窗口是必要等待,但轮数
+    // 有上限:窗口型 5 轮,超限交回**上游原文**,让外层退避重试或换档。
     let calls = 0;
     const fetchFn = (async () => {
       calls += 1;
@@ -475,9 +478,7 @@ describe("SensenovaAdapter", () => {
       });
     }) as unknown as typeof fetch;
     const adapter = new SensenovaAdapter([{ username: "a", api_key: "ka" }], fetchFn);
-    // 外层「总预算」用 AbortSignal 表达：120ms 后 abort。
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 120);
+    // **不给 signal**:证明终止靠轮数上限,不是外层总预算。
     let err: unknown;
     try {
       await adapter.runWithAccount(
@@ -485,25 +486,51 @@ describe("SensenovaAdapter", () => {
         {},
         "m1",
         { apiKey: "ka" },
-        ac.signal,
-        0.02, // 节奏窗口 20ms：期间会重置多次，但不会因此抛错
+        undefined,
+        0.02, // 节奏窗口 20ms:6 轮 × 20ms 内必然耗尽
       );
     } catch (e) {
       err = e;
-    } finally {
-      clearTimeout(timer);
     }
     const e = err as UpstreamError;
     expect(e).toBeInstanceOf(UpstreamError);
-    // 用户定案「返回上一次的报错信息，没有才返回超时」：
-    // 这里每次都是真实 429，所以交回的是**上游原文**，而不是我们自己编的
-    // 「池内已无可换」或一句泛泛的 timeout。kind 由 classifyError 归因
-    // （这类 429 归 pool_exhausted），这里只钉「交回的是那次的真实错误」。
+    // 用户定案「返回上一次的报错信息」:交回的是**上游原文**(真实 429),
+    // 不是我们自己编的「池内已无可换」或一句泛泛的 timeout。
     expect(e.message).toContain("rpm exhausted");
     expect(e.message).not.toContain("池内已无可换");
     expect(e.message).not.toContain("总超时预算耗尽");
-    // 确实在继续重试，而不是一轮就放弃。
-    expect(calls).toBeGreaterThanOrEqual(2);
+    // 5 轮等待 + 第 6 次 429 触发超限 → 恰好 6 次调用,没有第 7 次。
+    expect(calls).toBe(6);
+  });
+
+  it("瞬时型 429:短间隔重试到轮数上限后交回真实 429", async () => {
+    let calls = 0;
+    const fetchFn = (async () => {
+      calls += 1;
+      // 归因未知(非 ATTR_RPM / ATTR_SHARED)→ 瞬时型,COOLDOWN_ON_HOLD 短间隔。
+      return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+        status: 429,
+      });
+    }) as unknown as typeof fetch;
+    const adapter = new SensenovaAdapter([{ username: "a", api_key: "ka" }], fetchFn);
+    let err: unknown;
+    try {
+      await adapter.runWithAccount(
+        "https://x/v1/chat/completions",
+        {},
+        "m1",
+        { apiKey: "ka" },
+        undefined,
+        0.01,
+      );
+    } catch (e) {
+      err = e;
+    }
+    const e = err as UpstreamError;
+    expect(e).toBeInstanceOf(UpstreamError);
+    expect(e.message).toContain("rate limited");
+    // 瞬时型 12 轮:第 13 次 429 触发超限。
+    expect(calls).toBe(13);
   });
 
   it("一次真实错误都没拿到时，总预算耗尽报 timeout", async () => {
