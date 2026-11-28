@@ -1,12 +1,16 @@
 /**
- * bot-channel 行 —— SnowLuma（OneBot v11 正向 WS）连接持有 + 分级路由。
+ * bot-channel 行 —— SnowLuma（OneBot v11 正向 WS）托管 + 连接持有 + 分级路由。
  *
  * 事实来源：docs/bot-integration-design.md（确认版，2026-11-26）行 6；
  * lead 契约修正（m00121/m00185）：字符串 ID BotTarget、status() 返回
  * {connected, qq}、provide 两个服务、入站帧形状固定。
  *
  * 不变量：
- * - **只连不 spawn、绝不 kill SL**；SL 由独立入口常驻。
+ * - **SnowLuma 由本行托管**：spawn `node index.mjs`（cwd = SL 目录，其 launcher
+ *   即此入口），**先探测端口再 spawn**（已在跑就不双开）；心跳（缺省 60s）探测
+ *   进程活性，死了/卡死（端口连不通连续 N 轮）重拉；行卸载 tree-kill
+ *   （Windows `taskkill /PID x /T /F`）。托管配置走 setting 表键
+ *   `bot.channel.snowLuma.*`（autoStart 缺省开、dir、port）。
  * - 行间零互 import（arch.test R1）：只 import type 共享类型模块
  *   ./bot-channel-service.js 与 ./core-service.js，不 import 任何其他行。
  * - 单向发送，不做状态机、不做故障降级；连不上就 warn 一次后 resolve。
@@ -15,6 +19,10 @@
  *   （值 'chat'|'assistant'），不新建数据库表。
  */
 
+import { spawn, spawnSync } from "node:child_process";
+import { connect as netConnect } from "node:net";
+import { existsSync } from "node:fs";
+import type { ChildProcess } from "node:child_process";
 import type { Context } from "./context-types.js";
 import type { AsOneCoreService } from "./core-service.js";
 import { normalizeHistoryMessages } from "./bot-history.js";
@@ -40,8 +48,23 @@ import {
 export const name = "as-one-bot-channel";
 export const inject = ["webServer", "asOneCore"];
 
-/** SnowLuma OneBot v11 正向 WS（SL 独立入口常驻，本行只连）。 */
-const ONEBOT_WS_URL = "ws://127.0.0.1:63717/?access_token=27wDFiCfgJuxYCIqmAa3NOEepqewVC-R2oaUD7nbjoM";
+/** SnowLuma OneBot v11 正向 WS 的 access_token（与 SL config/onebot_3815403478.json 一致）。 */
+const SNOWLUMA_WS_TOKEN = "27wDFiCfgJuxYCIqmAa3NOEepqewVC-R2oaUD7nbjoM";
+/** SnowLuma OneBot v11 正向 WS 缺省端口（托管探测与连接共用）。 */
+const DEFAULT_SNOWLUMA_PORT = 63717;
+/** SnowLuma 发行包缺省目录（v1.14.13 win-x64 lite）。 */
+const DEFAULT_SNOWLUMA_DIR = "D:\\projects\\bot\\SnowLuma-v1.14.13-win-x64-lite";
+/** SnowLuma 入口脚本（其 launcher 即 `node ./index.mjs`）。 */
+const SNOWLUMA_ENTRY = "index.mjs";
+/** SnowLuma 托管心跳缺省间隔 60s。 */
+const DEFAULT_SNOWLUMA_HEARTBEAT_MS = 60_000;
+/** 心跳间隔钳制范围。 */
+const SNOWLUMA_HEARTBEAT_MIN_MS = 5_000;
+const SNOWLUMA_HEARTBEAT_MAX_MS = 3_600_000;
+/** 端口连续不通多少轮判「卡死」重拉（60s × 3 = 3 分钟宽限）。 */
+const SNOWLUMA_PORT_MISS_LIMIT = 3;
+/** TCP 探测超时。 */
+const SNOWLUMA_PROBE_TIMEOUT_MS = 2_000;
 /** 重连退避：首delay 500ms，指数增长，上限 30s。 */
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
@@ -158,6 +181,204 @@ function makeConfigService(core: AsOneCoreService): AsOneBotConfigService {
   };
 }
 
+/** 探测端口是否在听：能连上就认为 SnowLuma（或等价服务）已在跑。 */
+function probeSnowLumaPort(port: number, timeoutMs = SNOWLUMA_PROBE_TIMEOUT_MS): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (open: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        socket.destroy();
+      } catch {}
+      resolve(open);
+    };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    const socket = netConnect({ port, host: "127.0.0.1" });
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+  });
+}
+
+/** Windows tasklist 判 pid 活性（child 'exit' 之外的兜底，防僵尸句柄）。 */
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    const res = spawnSync(
+      "tasklist",
+      ["/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"],
+      { windowsHide: true, encoding: "utf-8", timeout: 5_000 },
+    );
+    if (res.status !== 0) return false;
+    const out = `${res.stdout ?? ""}`;
+    return out.includes(`,"${pid}",`) || out.includes(`,"${pid}"`);
+  } catch {
+    return false;
+  }
+}
+
+/** Windows tree-kill：taskkill /PID x /T /F（杀整棵进程树）。 */
+function killTree(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    const res = spawnSync(
+      "taskkill",
+      ["/PID", String(pid), "/T", "/F"],
+      { windowsHide: true, timeout: 10_000 },
+    );
+    return res.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** SnowLuma 托管配置（setting 表键 bot.channel.snowLuma.*，缺省兜底）。 */
+interface SnowLumaConfig {
+  autoStart: boolean;
+  port: number;
+  dir: string;
+  heartbeatMs: number;
+}
+
+/** 从 setting 表读 SnowLuma 托管配置；读失败/空值一律走缺省。 */
+function resolveSnowLumaConfig(setting: { get(key: string): { v?: string | null } | undefined }): SnowLumaConfig {
+  const str = (key: string, fallback: string): string => {
+    try {
+      return setting.get(key)?.v ?? fallback;
+    } catch {
+      return fallback;
+    }
+  };
+  const autoStart = str("bot.channel.snowLuma.autoStart", "1") !== "0";
+  const port = Number(str("bot.channel.snowLuma.port", String(DEFAULT_SNOWLUMA_PORT)));
+  const heartbeat = Number(str("bot.channel.snowLuma.heartbeatMs", String(DEFAULT_SNOWLUMA_HEARTBEAT_MS)));
+  return {
+    autoStart,
+    port: Number.isInteger(port) && port > 0 && port <= 65_535 ? port : DEFAULT_SNOWLUMA_PORT,
+    dir: str("bot.channel.snowLuma.dir", DEFAULT_SNOWLUMA_DIR).trim() || DEFAULT_SNOWLUMA_DIR,
+    heartbeatMs: Number.isFinite(heartbeat)
+      ? Math.min(Math.max(heartbeat, SNOWLUMA_HEARTBEAT_MIN_MS), SNOWLUMA_HEARTBEAT_MAX_MS)
+      : DEFAULT_SNOWLUMA_HEARTBEAT_MS,
+  };
+}
+
+/** SnowLuma supervisor：spawn/心跳自愈/卸载 kill。**先探测端口再 spawn**（外部
+ *  已在跑就不双开）；心跳发现进程退出或端口连续 N 轮不通 → tree-kill 重拉。 */
+function startSnowLumaSupervisor(ctx: Context, cfg: SnowLumaConfig): { stop(): void } {
+  if (!cfg.autoStart) {
+    ctx.logger?.info?.("[as-one] bot-channel: snowluma.autoStart off, not spawning");
+    return { stop: () => {} };
+  }
+  if (!existsSync(cfg.dir)) {
+    ctx.logger?.warn?.(
+      "[as-one] bot-channel: snowluma.autoStart on but dir missing, skip (set bot.channel.snowLuma.dir)",
+    );
+    return { stop: () => {} };
+  }
+
+  let child: ChildProcess | null = null;
+  /** 本 supervisor 是否「拥有」这个进程：false = 外部实例，不接管、卸载不 kill。 */
+  let owns = false;
+  let portMisses = 0;
+  let stopped = false;
+  let timer: ReturnType<typeof setInterval> | null = null;
+
+  /** spawn（先再探一次端口，防止外部实例刚起来的竞态双开）。 */
+  const spawnChild = async (why: string): Promise<void> => {
+    if (stopped) return;
+    if (await probeSnowLumaPort(cfg.port)) {
+      if (stopped) return;
+      ctx.logger?.info?.(
+        `[as-one] bot-channel: snowluma port ${cfg.port} already serving, skip spawn (${why})`,
+      );
+      return;
+    }
+    try {
+      if (stopped) return;
+      const c = spawn(process.execPath, [SNOWLUMA_ENTRY], {
+        cwd: cfg.dir,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      child = c;
+      owns = true;
+      portMisses = 0;
+      c.stdout?.on("data", (d: Buffer) => {
+        ctx.logger?.debug?.(`[snowluma] ${d.toString().trim()}`);
+      });
+      c.stderr?.on("data", (d: Buffer) => {
+        ctx.logger?.warn?.(`[snowluma] ${d.toString().trim()}`);
+      });
+      c.on("exit", (code, signal) => {
+        ctx.logger?.warn?.(`[as-one] bot-channel: snowluma exited code=${code} signal=${signal}`);
+        child = null;
+      });
+      ctx.logger?.info?.(`[as-one] bot-channel: snowluma spawned pid=${c.pid} (${why})`);
+    } catch (err) {
+      ctx.logger?.warn?.(`[as-one] bot-channel: snowluma spawn failed (${why}):`, err);
+    }
+  };
+
+  /** 心跳：死了重拉；活着但端口连不通连续 N 轮 → 判卡死，tree-kill 重拉。 */
+  const heartbeat = async (): Promise<void> => {
+    if (stopped || !owns) return; // 外部实例不接管
+    const alive =
+      child !== null &&
+      child.exitCode === null &&
+      child.signalCode === null &&
+      isPidAlive(child.pid ?? 0);
+    if (!alive) {
+      ctx.logger?.warn?.("[as-one] bot-channel: snowluma process gone, respawning");
+      void spawnChild("heartbeat: process gone");
+      return;
+    }
+    if (await probeSnowLumaPort(cfg.port)) {
+      portMisses = 0;
+      return;
+    }
+    portMisses += 1;
+    ctx.logger?.warn?.(
+      `[as-one] bot-channel: snowluma port ${cfg.port} dark (${portMisses}/${SNOWLUMA_PORT_MISS_LIMIT})`,
+    );
+    if (portMisses >= SNOWLUMA_PORT_MISS_LIMIT) {
+      const pid = child?.pid;
+      child = null;
+      ctx.logger?.warn?.("[as-one] bot-channel: snowluma wedged, killing tree and respawning");
+      if (pid !== undefined && !killTree(pid)) {
+        ctx.logger?.warn?.(`[as-one] bot-channel: snowluma taskkill failed pid=${pid}, will retry next tick`);
+      }
+      void spawnChild(`heartbeat: port dark x${SNOWLUMA_PORT_MISS_LIMIT}`);
+      portMisses = 0;
+    }
+  };
+
+  timer = setInterval(() => void heartbeat(), cfg.heartbeatMs);
+  timer.unref();
+
+  void (async () => {
+    if (await probeSnowLumaPort(cfg.port)) {
+      ctx.logger?.info?.(
+        `[as-one] bot-channel: snowluma port ${cfg.port} already serving (external?), supervisor idle`,
+      );
+      return;
+    }
+    await spawnChild("initial");
+  })();
+
+  return {
+    stop(): void {
+      stopped = true;
+      if (timer) clearInterval(timer);
+      const pid = child?.pid;
+      child = null;
+      if (pid !== undefined && owns && !killTree(pid)) {
+        ctx.logger?.warn?.(`[as-one] bot-channel: snowluma dispose taskkill failed pid=${pid}`);
+      }
+    },
+  };
+}
+
 /** 被引用文本截断上限（防止超长引用撑爆上下文）。 */
 const MAX_QUOTED_TEXT = 500;
 
@@ -228,6 +449,10 @@ export function apply(ctx: Context): void {
     async () => {
       const config = makeConfigService(core);
       const emitter = ctx as unknown as { emit(event: string, payload: unknown): void };
+      /** SnowLuma 托管：先解析配置并起 supervisor，再连它暴露的 OneBot WS。 */
+      const snowLumaCfg = resolveSnowLumaConfig(core.runtime.db.setting);
+      const snowLuma = startSnowLumaSupervisor(ctx, snowLumaCfg);
+      const snowLumaWsUrl = `ws://127.0.0.1:${snowLumaCfg.port}/?access_token=${SNOWLUMA_WS_TOKEN}`;
 
       let socket: MinimalSocket | null = null;
       let disposed = false;
@@ -395,7 +620,7 @@ export function apply(ctx: Context): void {
           ctx.logger?.warn?.("[as-one] WebSocket unavailable, bot channel inert");
           return;
         }
-        const ws = new Ctor(ONEBOT_WS_URL);
+        const ws = new Ctor(snowLumaWsUrl);
         socket = ws;
         ws.addEventListener("open", onOpen);
         ws.addEventListener("message", onMessage);
@@ -473,6 +698,7 @@ export function apply(ctx: Context): void {
 
       return () => {
         disposed = true;
+        snowLuma.stop();
         if (reconnectTimer !== null) clearTimeout(reconnectTimer);
         for (const [type, listener] of [
           ["open", onOpen],
@@ -482,7 +708,7 @@ export function apply(ctx: Context): void {
         ] as const) {
           socket?.removeEventListener(type, listener);
         }
-        socket?.close(); // 只断自己的 WS，绝不 kill SnowLuma
+        socket?.close(); // 只断自己的 WS；SnowLuma 进程由本行 supervisor 负责停
         socket = null;
         rejectPending(new Error("OneBot connection closed"));
       };

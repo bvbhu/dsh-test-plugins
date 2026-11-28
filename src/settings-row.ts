@@ -40,12 +40,6 @@ export interface SettingsConfig {
     /** 心跳间隔毫秒（bot-mhy 行钳制 5s..1h）。 */
     heartbeatMs: number;
   };
-  snowLuma: {
-    /** SnowLuma 自动托管开关（缺省 false，开发期 pm2 原样不动）。 */
-    autoStart: boolean;
-    /** SnowLuma 目录（开启时必填）。 */
-    dir?: string;
-  };
   signin: {
     /** 签到开关（缺省 true）。 */
     enabled: boolean;
@@ -65,10 +59,6 @@ export const Config = z.object({
     port: z.number().default(DEFAULT_YUNZAI_PORT).volatile(),
     autoStart: z.boolean().default(true).volatile(),
     heartbeatMs: z.number().default(DEFAULT_HEARTBEAT_MS).volatile(),
-  }),
-  snowLuma: z.object({
-    autoStart: z.boolean().default(false).volatile(),
-    dir: z.string().volatile(),
   }),
   signin: z.object({
     enabled: z.boolean().default(true).volatile(),
