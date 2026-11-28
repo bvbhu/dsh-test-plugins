@@ -1,16 +1,14 @@
 /**
- * bot-mhy 行 —— Yunzai supervisor 托管 + SnowLuma 受控入口 + 米游社签到通知。
+ * bot-mhy 行 —— Yunzai supervisor 托管 + 米游社签到通知。
  *
- * patch 行 `@bvbhu/as-one/bot-mhy`。只装三件事（与 chat/assistant/notify
+ * patch 行 `@bvbhu/as-one/bot-mhy`。只装两件事（与 chat/assistant/notify
  * 零服务引用，完全隔离）：
  *
  * 1. **Yunzai supervisor**：spawn `node app.js`（cwd = app 目录，trss-yunzai
  *    3.1.3 可裸跑）。**先探测再 spawn**：端口已通（开发期 pm2 原样运行）就
  *    不重复拉起；心跳（缺省 60s）探测进程活性，死了/卡死（端口连不通连续
  *    N 轮）重拉；行卸载 tree-kill（Windows `taskkill /PID x /T /F`）。
- * 2. **SnowLuma 通知**：开发期不动（pm2 原样），代码里只留受控入口——
- *    配置键 `bot.mhy.snowLuma.autoStart`（缺省 false）等，联调时 lead 开启。
- * 3. **签到**：每天 00:02（`bot.mhy.signin.time` 可覆盖）跑
+ * 2. **签到**：每天 00:02（`bot.mhy.signin.time` 可覆盖）跑
  *    `plugins/xiaoyao-cvs-plugin/sign-all.mjs`（cwd = app 目录，脚本按
  *    process.cwd() 拼 import 路径），跑完 emit `as-one:bot:mhy-signin`
  *    事件（payload {ok, summary}）给 bot-notify 行消费；结果同时经
@@ -28,8 +26,6 @@
  *   bot.mhy.yunzai.port         探测端口（缺省读 app/config/config/server.yaml，再缺省 2536）
  *   bot.mhy.yunzai.autoStart    缺省开（探测先行，pm2 在跑时不会双开）
  *   bot.mhy.yunzai.heartbeatMs  心跳间隔（缺省 60000，钳制 5s..1h）
- *   bot.mhy.snowLuma.autoStart  SnowLuma 自动托管开关（缺省 false，开发期不动）
- *   bot.mhy.snowLuma.dir        SnowLuma 目录（开启时必填）
  *   bot.mhy.signin.enabled      签到开关（缺省 true）
  *   bot.mhy.signin.time         每天签到时刻 HH:MM（缺省 "00:02"）
  *   bot.mhy.signin.ownerQQ      直推主人 QQ（缺省 3187192488）
@@ -87,8 +83,6 @@ interface MhyConfig {
   yunzaiPort: number;
   yunzaiAutoStart: boolean;
   heartbeatMs: number;
-  snowLumaAutoStart: boolean;
-  snowLumaDir: string;
   signinEnabled: boolean;
   signinTime: string;
   signinScript: string;
@@ -215,7 +209,6 @@ async function resolveConfig(
   const signinTime = String(sVal("signin.time") ?? (await str("bot.mhy.signin.time", DEFAULT_SIGNIN_TIME))).trim();
 
   const autoStartVal = sVal("yunzai.autoStart");
-  const snowAutoVal = sVal("snowLuma.autoStart");
   const signinEnabledVal = sVal("signin.enabled");
 
   return {
@@ -228,9 +221,6 @@ async function resolveConfig(
       Number.isFinite(heartbeatMs)
         ? Math.min(Math.max(heartbeatMs, HEARTBEAT_MIN_MS), HEARTBEAT_MAX_MS)
         : DEFAULT_HEARTBEAT_MS,
-    snowLumaAutoStart:
-      snowAutoVal !== undefined ? snowAutoVal === true : (await str("bot.mhy.snowLuma.autoStart", "0")) === "1",
-    snowLumaDir: String(sVal("snowLuma.dir") ?? (await str("bot.mhy.snowLuma.dir", ""))).trim(),
     signinEnabled:
       signinEnabledVal !== undefined ? signinEnabledVal === true : (await str("bot.mhy.signin.enabled", "1")) !== "0",
     signinTime: /^([01]\d|2[0-3]):[0-5]\d$/.test(signinTime) ? signinTime : DEFAULT_SIGNIN_TIME,
@@ -347,41 +337,6 @@ function startYunzaiSupervisor(
       child = null;
       if (pid !== undefined && owns && !killTree(pid)) {
         ctx.logger?.warn?.(`[as-one] bot-mhy: dispose taskkill failed pid=${pid}`);
-      }
-    },
-  };
-}
-
-/** SnowLuma 受控入口：开发期缺省关（pm2 原样），联调时 lead 开 autoStart。 */
-function startSnowLuma(ctx: Context, cfg: MhyConfig): { stop(): void } | null {
-  if (!cfg.snowLumaAutoStart) {
-    ctx.logger?.info?.("[as-one] bot-mhy: snowluma.autoStart off (dev pm2 untouched)");
-    return null;
-  }
-  if (!cfg.snowLumaDir || !existsSync(cfg.snowLumaDir)) {
-    ctx.logger?.warn?.(
-      "[as-one] bot-mhy: snowluma.autoStart on but dir unset/missing, skip (set bot.mhy.snowLuma.dir)",
-    );
-    return null;
-  }
-  let child: ChildProcess | null = null;
-  try {
-    child = spawn(process.execPath, ["app.js"], {
-      cwd: cfg.snowLumaDir,
-      windowsHide: true,
-      stdio: "ignore",
-    });
-    ctx.logger?.info?.(`[as-one] bot-mhy: snowluma spawned pid=${child.pid}`);
-  } catch (err) {
-    ctx.logger?.warn?.("[as-one] bot-mhy: snowluma spawn failed:", err);
-    return null;
-  }
-  return {
-    stop(): void {
-      const pid = child?.pid;
-      child = null;
-      if (pid !== undefined && !killTree(pid)) {
-        ctx.logger?.warn?.(`[as-one] bot-mhy: snowluma dispose taskkill failed pid=${pid}`);
       }
     },
   };
@@ -582,9 +537,6 @@ export function apply(ctx: Context): void {
       );
 
       const yunzai = startYunzaiSupervisor(ctx, cfg);
-      const snowluma = startSnowLuma(ctx, cfg);
-      const disposers: (() => void)[] = [];
-      if (snowluma) disposers.push(snowluma.stop);
 
       if (cfg.signinEnabled) {
         const signin = async (): Promise<void> => {
@@ -609,9 +561,8 @@ export function apply(ctx: Context): void {
 
       return () => {
         yunzai.stop();
-        for (const dispose of disposers.reverse()) dispose();
       };
     },
-    "@bvbhu/as-one/bot-mhy: yunzai supervisor + snowluma entry + daily signin",
+    "@bvbhu/as-one/bot-mhy: yunzai supervisor + daily signin",
   );
 }

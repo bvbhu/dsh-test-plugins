@@ -18,10 +18,6 @@ export interface AsOneMhySettingsService {
       autoStart: Volatile<boolean>;
       heartbeatMs: Volatile<number>;
     };
-    snowLuma: {
-      autoStart: Volatile<boolean>;
-      dir: Volatile<string>;
-    };
     signin: {
       enabled: Volatile<boolean>;
       time: Volatile<string>;
